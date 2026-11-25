@@ -14,6 +14,9 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
     "test": "node --no-warnings --import tsx --test tests/*.spec.ts",
+    "verify:postgres": "node scripts/verify-postgres-rls.mjs",
+    "drill:backup": "node --no-warnings --import tsx scripts/backup-drill.mjs",
+    "smoke:load": "node scripts/smoke-load.mjs",
     "hive": "node --no-warnings --import tsx src/cli/hive.ts"
   },
   "dependencies": {
@@ -27,9 +30,11 @@
   "devDependencies": {
     "@tailwindcss/vite": "4.1.17",
     "@types/node": "22.19.17",
+    "@types/pg": "^8.23.1",
     "@types/react": "19.2.7",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "5.1.1",
+    "pg": "^8.23.1",
     "tailwindcss": "4.1.17",
     "tsx": "^4.19.3",
     "typescript": "5.9.3",

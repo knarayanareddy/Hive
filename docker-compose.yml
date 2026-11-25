@@ -1,0 +1,37 @@
+# Local Postgres 16 for Hive — matches db/migrations/001_postgres_rls.sql
+# Usage:
+#   docker compose up -d postgres
+#   HIVE_PG_ADMIN_URL=postgresql://postgres:postgres@localhost:5432/postgres npm run verify:postgres
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: hive-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: hive
+    ports:
+      - "5432:5432"
+    volumes:
+      - hive-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hive"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # Optional: real gateway backed by Postgres once the kernel grows a PG store.
+  # gateway:
+  #   build: .
+  #   environment:
+  #     HIVE_PG_ADMIN_URL: postgresql://postgres:postgres@postgres:5432/hive
+  #     HIVE_GATEWAY_TOKEN: ${HIVE_GATEWAY_TOKEN:?set HIVE_GATEWAY_TOKEN}
+  #   ports:
+  #     - "8787:8787"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+
+volumes:
+  hive-pgdata:

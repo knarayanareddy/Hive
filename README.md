@@ -27,7 +27,7 @@ See [`ARCHITECTURE_REVIEW.md`](./ARCHITECTURE_REVIEW.md) for the full end-to-end
 # Install dependencies
 npm install
 
-# Run all 10 Chaos Acceptance Test Specs
+# Run all 12 acceptance specs (10 chaos + 2 live-integration against mock GitHub/Slack)
 npm test
 
 # Start the HTTP Authority Server (port 8787) + Vite Web UI (port 5173)
@@ -35,7 +35,25 @@ npm run dev
 
 # Type-check & build production bundle
 npm run build
+
+# Verify Postgres 16 FORCE-RLS migration against a real database
+# (docker compose up -d postgres first, or any Postgres 16 admin URL)
+HIVE_PG_ADMIN_URL=postgresql://postgres:postgres@localhost:5432/postgres npm run verify:postgres
+
+# Backup/PITR restore drill against real DB files
+npm run drill:backup
+
+# Load canary for the running gateway (concurrency 32 x 8 rounds)
+npm run smoke:load
 ```
+
+**Going live with GitHub / Slack:** set `HIVE_GITHUB_REPO=owner/name` +
+`HIVE_GITHUB_TOKEN` (or `gh auth login`) and/or `HIVE_SLACK_WEBHOOK_URL`
+(or `HIVE_SLACK_BOT_TOKEN` + `HIVE_SLACK_CHANNEL`), then restart. Boot logs print
+`[hive-integrations] mode=…` and the Live Hive page shows `github:live` /
+`slack:live` pills. Set `HIVE_GATEWAY_TOKEN` to require bearer auth on the API.
+See [`INFRASTRUCTURE.md`](./INFRASTRUCTURE.md) for the full runbook and honest
+status of every review caveat, and [`.env.example`](./.env.example) for all variables.
 
 ---
 
@@ -67,7 +85,7 @@ HIVE_ACTOR=ana ./bin/hive.mjs "/approve 801 --sha 3fa9c1"
 
 ---
 
-## Chaos Acceptance Test Matrix (`npm test`)
+## Acceptance Test Matrix (`npm test`)
 
 | Spec | Invariant Verified |
 |---|---|
@@ -81,3 +99,4 @@ HIVE_ACTOR=ana ./bin/hive.mjs "/approve 801 --sha 3fa9c1"
 | `tests/authority.pitr.spec.ts` | SQLite PITR snapshot restore rotates `incarnation` and rejects post-snapshot tokens (`409`) |
 | `tests/rls.isolation.spec.ts` | Empty tenant context denied (`403`); cross-tenant queries & tokens strictly isolated |
 | `tests/wake.redeliver.spec.ts` | Dropped wake redelivered; `ackWake` cursor is idempotent; dependent task `#803` unblocks only on `VerifiedClose` |
+| `tests/integrations.spec.ts` | Kernel outbox → **live-wired** GitHub/Slack gateways (mock providers on 127.0.0.1): idempotent PR creation, merge/branch/comment read-back reconciliation, Slack ledger dedupe, DLP failure marking, `HIVE_INTEGRATIONS` mode resolution |

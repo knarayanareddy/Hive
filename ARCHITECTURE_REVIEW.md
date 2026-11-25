@@ -51,3 +51,19 @@ It synthesizes two complementary agent-collaboration launches plus LoopX operati
 | **SQLite WAL + Postgres 16 Forced RLS** | `db/migrations/001_sqlite.sql`, `db/migrations/001_postgres_rls.sql` | `rls.isolation.spec.ts` |
 | **CLI, Registered `/commands` & HTTP Gateway** | `src/cli/parser.ts`, `src/cli/hive.ts`, `src/server/index.ts` | `./bin/hive.mjs`, `/api/*` |
 | **Live Web Mission Control + Design Explorer** | `src/web/LiveHivePage.tsx`, `src/App.tsx` | `npm run build` + live preview |
+
+---
+
+## 5. Infrastructure Pass (2026-11-25) — Review Caveats Closed
+
+| # | Original caveat | Resolution | Verification |
+|---|---|---|---|
+| 1 | Postgres never executed | Applied `001_postgres_rls.sql` to **real PostgreSQL 16.2** (user-space pgserver, unix socket); threw it away afterwards | `node scripts/verify-postgres-rls.mjs` → **25/25 checks PASS** (FORCE RLS flags, default-deny unset/empty tenant, cross-tenant SELECT/UPDATE/DELETE, `WITH CHECK` insert denial, FTS-scoped reads, read-only `authority_meta`, tenant_b survives). Re-runnable via `npm run verify:postgres`; enforced in CI (`.github/workflows/ci.yml` `postgres-rls` job on `postgres:16-alpine`) |
+| 2 | Integrations simulated | New `src/integrations/` (GitHub REST gateway with provider-side read-back for open-pr/merge/comment/branch; Slack webhook or chat.postMessage gateway; append-only effect ledger for Slack's missing idempotency; `LiveEffectConnectorHub` composed into the **same** outbox path the chaos specs exercise). `HIVE_INTEGRATIONS=auto\|live\|simulation`, fail-fast `live` mode, never-silent fallback | `tests/integrations.spec.ts` (**2/2 PASS**, in `npm test`): mock providers as **separate processes** (kernel effect path is synchronous curl); asserts 1 POST per effect, fresh-key read-back reconciliation after simulated crash, marker-based comment dedupe, ledger read-back, DLP `sk_live_*` → outbox `failed`, mode resolution. Boot log prints `[hive-integrations] …`; UI shows `github:`/`slack:` mode pills; `GET /api/integrations/status` |
+| 3 | No browser QA | Not possible in-sandbox (no browser binary; browser CDNs outside the egress allowlist). Mitigations: production build green; all UI-called endpoints curl-verified; pill degrades on 401 | Visual click-through still recommended before trusting the UI (`npm run dev` → :5173) |
+| 4 | Prototype tabs remain prototypes | Kept as side-by-side reference (documented in INFRASTRUCTURE.md §4); in-memory engines unchanged; `Live Hive` remains the only tab on the real kernel | n/a |
+| 5 | Pushed? | `arena/446b8aab-hive` pushed to origin (this pass included) | `git push origin arena/446b8aab-hive` in CI session log |
+| 5b | Deployment | `vercel.json` (Vite preset, `dist` output, SPA rewrites) — static UI deploys as-is; backend needs external gateway host (see INFRASTRUCTURE.md §5). No deploy triggered yet (user go-ahead pending) | `npm run build` green; Vercel connector connected but intentionally unused |
+| 6 | Hardening | `HIVE_GATEWAY_TOKEN` bearer guard (health exempt, verified 401/200 matrix), `HIVE_EFFECT_LEDGER`, `.env.example`, `docker-compose.yml` (Postgres 16), CI (build+test+RLS), `npm run drill:backup` (real-file PITR drill → incarnation rotation, stale-token rejection, FTS5 survival — **all checks PASS**), `npm run smoke:load` (512 reqs @ c=32: health p50≈8ms; /api/state p95≈168ms) | See INFRASTRUCTURE.md §§5–6 for residuals (no secrets manager, no TLS/WAF, no pg runtime store, no exactly-once Slack) |
+
+Full runbook: [`INFRASTRUCTURE.md`](./INFRASTRUCTURE.md). Environment reference: [`.env.example`](./.env.example).

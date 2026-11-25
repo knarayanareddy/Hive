@@ -6,6 +6,7 @@ import { HiveStore } from "../kernel/db";
 import { HiveKernel } from "../kernel/authority";
 import { DEFAULT_TENANT, seedWorkspace } from "../kernel/seed";
 import { executeHiveCli } from "../cli/parser";
+import { resolveEffectHub, integrationStatus } from "../integrations";
 import {
   FencedError,
   ForbiddenError,
@@ -18,9 +19,10 @@ const PORT = Number(process.env.HIVE_API_PORT ?? 8787);
 const HOST = process.env.HIVE_API_HOST ?? "0.0.0.0";
 const DB_PATH =
   process.env.HIVE_DB_PATH ?? path.resolve(process.cwd(), ".hive/live.db");
+const GATEWAY_TOKEN = process.env.HIVE_GATEWAY_TOKEN?.trim() || null;
 
 let store = new HiveStore(DB_PATH);
-let kernel = new HiveKernel(store);
+let kernel = new HiveKernel(store, resolveEffectHub());
 seedWorkspace(kernel, "acme");
 seedWorkspace(kernel, "globex");
 
@@ -42,7 +44,7 @@ function resetAll() {
     fs.rmSync(DB_PATH + "-shm", { force: true });
   }
   store = new HiveStore(DB_PATH);
-  kernel = new HiveKernel(store);
+  kernel = new HiveKernel(store, resolveEffectHub());
   seedWorkspace(kernel, "acme");
   seedWorkspace(kernel, "globex");
   tokenJarsByTenant.acme = {};
@@ -269,6 +271,20 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const pathname = url.pathname;
 
+  // Optional gateway bearer auth (HIVE_GATEWAY_TOKEN). When set, everything
+  // except GET /api/health requires `Authorization: Bearer <token>` — including
+  // GET /api/state, which leaks tenant data. Health stays open for probes.
+  if (GATEWAY_TOKEN && !(req.method === "GET" && pathname === "/api/health")) {
+    const auth = req.headers.authorization ?? "";
+    if (auth !== `Bearer ${GATEWAY_TOKEN}`) {
+      sendJson(res, 401, {
+        ok: false,
+        error: "gateway bearer token required (set HIVE_GATEWAY_TOKEN on server and send Authorization: Bearer <token>)",
+      });
+      return;
+    }
+  }
+
   try {
     if (req.method === "GET" && pathname === "/api/health") {
       sendJson(res, 200, {
@@ -276,6 +292,11 @@ const server = http.createServer(async (req, res) => {
         incarnation: kernel.getIncarnation(),
         now: kernel.now(),
       });
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/integrations/status") {
+      sendJson(res, 200, integrationStatus());
       return;
     }
 
@@ -642,7 +663,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
+  const s = integrationStatus();
   console.log(
     `[hive-authority] listening on http://${HOST}:${PORT} (db=${DB_PATH}, incarnation=${kernel.getIncarnation()})`,
+  );
+  console.log(
+    `[hive-integrations] mode=${s.mode} github=${s.github.mode} [${s.github.detail}] slack=${s.slack.mode} [${s.slack.detail}] gateway=${s.gatewayAuth}`,
   );
 });

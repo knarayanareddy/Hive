@@ -29,6 +29,32 @@ import {
 import { Badge, Btn, Card, Code, SectionTitle, Tabs, type Tone } from "../components/ui";
 import { cn } from "../utils/cn";
 
+/**
+ * Deployed-frontend → remote-gateway support.
+ * When Hive's static build is hosted somewhere without the Node gateway
+ * (e.g. Vercel), set VITE_HIVE_API_BASE to the gateway origin
+ * (e.g. https://hive-gateway.example.com) so the UI calls it cross-origin.
+ * When the gateway requires HIVE_GATEWAY_TOKEN bearer auth, set
+ * VITE_HIVE_API_TOKEN to the same token — it is sent as Authorization: Bearer.
+ */
+const API_BASE = (import.meta.env.VITE_HIVE_API_BASE as string | undefined) ?? "";
+const API_TOKEN = (import.meta.env.VITE_HIVE_API_TOKEN as string | undefined) ?? "";
+const apiFetch = (input: string, init?: RequestInit) =>
+  fetch(`${API_BASE}${input}`, {
+    ...init,
+    headers: {
+      ...(init?.headers ?? {}),
+      ...(API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}),
+    },
+  });
+
+interface IntegrationsStatus {
+  mode: string;
+  gatewayAuth: "bearer-required" | "open-dev";
+  github: { mode: "live" | "simulation"; detail: string };
+  slack: { mode: "live" | "simulation"; detail: string };
+}
+
 interface Attestation {
   owner: string;
   scope: string[];
@@ -229,6 +255,7 @@ export default function LiveHivePage() {
   const [searchResults, setSearchResults] = useState<EventRecord[]>([]);
   const [chaosResults, setChaosResults] = useState<ChaosResult[] | null>(null);
   const [inspectEvent, setInspectEvent] = useState<EventRecord | null>(null);
+  const [integrations, setIntegrations] = useState<IntegrationsStatus | null>(null);
   const termRef = useRef<HTMLDivElement>(null);
 
   const appendTerm = useCallback(
@@ -239,7 +266,7 @@ export default function LiveHivePage() {
   );
 
   const fetchState = useCallback(async (t = tenant) => {
-    const res = await fetch(`/api/state?tenant=${encodeURIComponent(t)}`);
+    const res = await apiFetch(`/api/state?tenant=${encodeURIComponent(t)}`);
     const data = (await res.json()) as WorkspaceSnapshot;
     setSnap(data);
   }, [tenant]);
@@ -247,6 +274,13 @@ export default function LiveHivePage() {
   useEffect(() => {
     void fetchState(tenant);
   }, [tenant, fetchState]);
+
+  useEffect(() => {
+    apiFetch("/api/integrations/status")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => setIntegrations((data as IntegrationsStatus | null) ?? null))
+      .catch(() => setIntegrations(null));
+  }, []);
 
   useEffect(() => {
     termRef.current?.scrollTo({ top: 1e6, behavior: "smooth" });
@@ -257,7 +291,7 @@ export default function LiveHivePage() {
     setBusy(true);
     appendTerm({ kind: "in", text: `${who}@${tenant} $ ${line}` });
     try {
-      const res = await fetch("/api/cli", {
+      const res = await apiFetch("/api/cli", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tenant, actor: who, line }),
@@ -284,7 +318,7 @@ export default function LiveHivePage() {
   async function runDrill(drill: string, taskId = selTaskId) {
     setBusy(true);
     try {
-      const res = await fetch("/api/scenario", {
+      const res = await apiFetch("/api/scenario", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tenant, drill, taskId }),
@@ -310,7 +344,7 @@ export default function LiveHivePage() {
     setBusy(true);
     setTab("ops");
     try {
-      const res = await fetch("/api/chaos-run", { method: "POST" });
+      const res = await apiFetch("/api/chaos-run", { method: "POST" });
       const json = (await res.json()) as { ok: boolean; results: ChaosResult[] };
       setChaosResults(json.results);
       appendTerm({
@@ -325,7 +359,7 @@ export default function LiveHivePage() {
   async function resetDb() {
     setBusy(true);
     try {
-      const res = await fetch("/api/reset", {
+      const res = await apiFetch("/api/reset", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tenant }),
@@ -342,7 +376,7 @@ export default function LiveHivePage() {
   async function toggleAttestation(agentId: string, op: "revoke" | "restore" | "expire") {
     setBusy(true);
     try {
-      const res = await fetch("/api/attestation", {
+      const res = await apiFetch("/api/attestation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tenant, actor: "ana", agentId, op }),
@@ -362,7 +396,7 @@ export default function LiveHivePage() {
     if (!guestText.trim()) return;
     setBusy(true);
     try {
-      const res = await fetch("/api/ingest", {
+      const res = await apiFetch("/api/ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -396,7 +430,7 @@ export default function LiveHivePage() {
       return;
     }
     const id = setTimeout(async () => {
-      const res = await fetch(
+      const res = await apiFetch(
         `/api/search?tenant=${encodeURIComponent(tenant)}&q=${encodeURIComponent(searchQ)}`,
       );
       const json = (await res.json()) as { results: EventRecord[] };
@@ -442,6 +476,27 @@ export default function LiveHivePage() {
             <Badge tone="zinc">
               <Database size={10} /> inc:{snap.incarnation.slice(0, 8)}
             </Badge>
+            {integrations && (
+              <>
+                <span title={integrations.github.detail}>
+                  <Badge tone={integrations.github.mode === "live" ? "emerald" : "zinc"}>
+                    ⎇ github:{integrations.github.mode}
+                  </Badge>
+                </span>
+                <span title={integrations.slack.detail}>
+                  <Badge tone={integrations.slack.mode === "live" ? "emerald" : "zinc"}>
+                    💬 slack:{integrations.slack.mode}
+                  </Badge>
+                </span>
+                {integrations.gatewayAuth === "bearer-required" && (
+                  <span title="Gateway requires Authorization: Bearer (HIVE_GATEWAY_TOKEN)">
+                    <Badge tone="amber">
+                      <Lock size={10} /> bearer
+                    </Badge>
+                  </span>
+                )}
+              </>
+            )}
           </div>
 
           <div className="ml-auto flex flex-wrap items-center gap-2 text-xs">
