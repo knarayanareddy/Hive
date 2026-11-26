@@ -40,7 +40,7 @@ Every load-bearing claim below was re-verified against this repository before ac
 
 - `npm test` green — all specs (12 chaos/integration + session/authz/webhooks/custody) pass (updated only where they exercised the
   vulnerable tokenless path) **plus** new specs listed in each phase.
-- `npm run verify:postgres` — 28/28 RLS checks (incl. principal_session + webhook_delivery + artifact).
+- `npm run verify:postgres` — **30/30 RLS checks** (incl. principal_session + webhook_delivery + artifact + schema_def + channel_room; M1 landed 2026-11-26).
 - `npm run drill:backup` — all PASS (now including stale-WAL restore drill).
 - Bearer-token matrix re-verified on a live local gateway for `/api/state`, `/api/cli`, `/api/reset`.
 - INFRASTRUCTURE.md states only what is true of the shipped tree.
@@ -173,7 +173,8 @@ coverage caveat. `TODO.md` gh-CLI line → opt-in (`HIVE_GITHUB_USE_GH_CLI=1`). 
 
 **Explicitly deferred:** PG runtime parity (0.7-parity / M1) — lands as Phase 0.5 or first item of
 Phase 1 after the above, since it doubles the review surface; `schema_def`+`channel_room`+type alignment
-+12 specs on PG16 + 28/28 RLS (as of Phase 2's artifact addition). Enum collapse — dedicated PR (§2.4).
++PG parity landed 2026-11-26 as its dedicated PR (§2.4): missing tables/columns, `*_json` JSONB naming,
+fts_doc + task_id, sim_now_ms, 12→7 enum collapse — see `docs/migrations/001`. 30/30 RLS.
 
 ## 6. Phase 1 — Perimeter, performance, correctness
 Foreign `Host` 421 + 1 MiB cap (from 0.5), per-identity token buckets (6000 req/min, 60 effect calls/min,
@@ -199,6 +200,23 @@ drill (PR open → SHA-bound merge → closed) with explicit user go-ahead; `INF
 **Phase 4 — discipline**: `docs/adr/` (authority-kernel CAS fencing, verified-close non-author,
 single-machine vs PG RLS, webhook HMAC, outbox commit-then-send), `GLOSSARY.md`, explicit rejections of
 ADR 0042/0061/0030/0127 in writing, `drill-stuck-verifier.mjs`, `drill:backup` in CI.
+
+### Execution log — M1 dedicated migration PR (2026-11-26, PR follows)
+
+- **PG parity applied in place** (pre-production): `schema_def` + `channel_room` (tenant-scoped,
+  FORCE RLS — loop now 17 tables), `authority_meta.sim_now_ms` + custodial `gateway_priv`
+  (encrypted `enc:v1:*`, nullable, SELECT-only for the app role), `principal.privkey` (custodial,
+  nullable), JSON columns unified to the kernel's `*_json` names typed JSONB (`can TEXT[]` →
+  `can_json JSONB`; `labels→labels_json`; `payload/attest/result/args/receipt` likewise),
+  `event.fts_doc` now includes `task_id`, tenant-scoped event indexes restored.
+- **12→7 observable task states** — removed `expired`/`submitted`/`merged`/`rejected`/`reopened`;
+  they were transactional waypoints written and rewritten inside one tx and never persisted.
+  All write paths now do a single atomic CAS to the persisted state; the merge path closes with
+  one CAS guarded by `state IN ('awaiting_approval','verifying') AND fresh revision`.
+  Migration note + rollback: `docs/migrations/001-enum-collapse-and-pg-schema-parity.md`.
+- Verify script extended (17 tables; seed uses `payload_json`): **30/30 RLS checks**.
+- Specs stay **32/32**; `drill:backup` PASS; `drill:stuck-verifier` 13/13; dev DBs re-seeded
+  fresh per decision §2.6 — the demo DB was backed up to `/tmp/hive-live-pre-m1.db` then re-seeded.
 
 ## 8. Workbench disposition (X2)
 Both Drive zips are **archived review artifacts**, not deliverables: no deploys, no authored PRs,
@@ -253,7 +271,8 @@ checklist inside the repo (Phase 4) — do not revive the zips.
   tokenless path (`gate.sha.spec.ts` now exercises reject→re-claim→push).
 - **PG RLS parity for the two new tables** landed in `001_postgres_rls.sql`
   (strict `app.tenant_id <> ''` predicate) + `verify-postgres-rls.mjs` covers both
-  (28/28). Full `schema_def`/`channel_room`/`sim_now_ms` PG alignment (M1) remains
+  (30/30). M1 `schema_def`/`channel_room`/`sim_now_ms` PG alignment + enum collapse landed
+  as its dedicated PR (§2.4) on 2026-11-26.
   Phase 0.5/1 as planned.
 - **Pushed + PR #3 opened 2026-11-26** (https://github.com/knarayanareddy/Hive/pull/3) on explicit user go-ahead. Phase 0 closed.
 

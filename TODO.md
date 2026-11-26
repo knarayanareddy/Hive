@@ -60,7 +60,7 @@ egress allowlist, and no user-provided GitHub repo/token exists here.
 single-writer, local disk. The design's Principle 8 ("same semantics local and
 cloud") wants Postgres 16 + FORCE RLS as the production store, not just as a
 verified schema. The migration and its verifier (`npm run verify:postgres`,
-28/28 checks) are the acceptance gate that already exists.
+30/30 checks) are the acceptance gate that already exists.
 
 **Blocked by:** engineering decision (connection strategy for serverless vs
 long-lived gateway) and a managed Postgres instance.
@@ -90,7 +90,7 @@ long-lived gateway) and a managed Postgres instance.
 
 **Acceptance criteria:**
 - [ ] All 17 specs pass with `HIVE_STORE=postgres`.
-- [ ] `npm run verify:postgres` still 28/28 (incl. artifact).
+- [ ] `npm run verify:postgres` still 30/30 (incl. schema_def/channel_room).
 - [ ] A pre-restore token is rejected after a PITR restore on pg (mirror of
       `authority.pitr.spec.ts`).
 - [ ] One chaos drill (`gate.sha`) executed against the pg backend with logs.
@@ -165,4 +165,5 @@ TLS/WAF in front of the gateway, secrets-manager integration, alerting export of
 `call_telemetry`, queue worker for exactly-once Slack delivery, Postgres runtime
 store (item #2 owns this). (GitHub/Slack webhook receivers WITH HMAC verification
 landed 2026-11-26 — HIVE_GITHUB_WEBHOOK_SECRET / HIVE_SLACK_SIGNING_SECRET. Phase 2
-(single-origin serve, SSE, presence, artifacts, SDK, outbox worker) landed 2026-11-27.)
+(single-origin serve, SSE, presence, artifacts, SDK, outbox worker) landed
+2026-11-27. M1 (PG parity + 12→7 enum collapse) landed 2026-11-26 as its dedicated migration PR.)

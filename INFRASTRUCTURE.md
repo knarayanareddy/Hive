@@ -1,7 +1,7 @@
 # Hive — Infrastructure & Integration Runbook
 
 Status of every item from the post-build review, what was done, what is
-**verified**, and what you must supply. Last updated: 2026-11-27.
+**verified**, and what you must supply. Last updated: 2026-11-26.
 
 > **Tracked work:** the open items in this file are actionable backlog in [`TODO.md`](./TODO.md).
 
@@ -13,8 +13,9 @@ Status of every item from the post-build review, what was done, what is
   wheel, unix socket) and exercised by `scripts/verify-postgres-rls.mjs`, which:
   recreates a throwaway database (`hive_rls_verify`, dropped afterwards), applies the
   migration twice (idempotent), grants least-privilege rights to a **non-superuser**
-  role `hive_rls_app`, seeds two tenants, and asserts **28/28 checks** (incl. the `artifact` table):
-  ENABLE + FORCE RLS on all 15 tenant tables, default-deny (unset *and* empty
+  role `hive_rls_app`, seeds two tenants, and asserts **30/30 checks** (incl. the `artifact`,
+  `schema_def` and `channel_room` tables):
+  ENABLE + FORCE RLS on all 17 tenant tables, default-deny (unset *and* empty
   `app.tenant_id`), cross-tenant SELECT/UPDATE/DELETE isolation, `WITH CHECK` insert
   denial, FTS5/GIN `tsvector` scoping, and read-only `authority_meta` bootstrap.
 - **Run it yourself:** `docker compose up -d postgres` then
@@ -204,6 +205,21 @@ Shipped in Phase 2 (2026-11-27, single-origin serve + streaming + SDK):
   download browsers, so CI remains the verification path.
 - `scripts/smoke-load.mjs` gains a single-origin static drill; `npm run serve` documented.
 - New specs: 17 → **32** (`streams`, `outbox.worker`, `artifacts`, `sdk`). Specs pin the sim clock via `tests/_setup.ts`.
+
+Shipped as M1 — dedicated migration PR (2026-11-26, PR follows):
+- **PG schema parity** — the PG DDL is now table-for-table aligned with the SQLite
+  kernel contract: `schema_def` + `channel_room` added (FORCE RLS, tenant-scoped),
+  `authority_meta.sim_now_ms`, custodial `gateway_priv`/`principal.privkey`
+  (encrypted, nullable pre-keygen), all JSON columns renamed to the kernel's
+  `*_json` names and typed `JSONB` (`can TEXT[]` removed), `event.fts_doc` now
+  includes `task_id`, tenant-scoped event indexes restored. Timestamps remain
+  PG-native (route B); a future pg-store adapts at the boundary.
+- **12→7 task-state enum collapse** — `expired`/`submitted`/`rejected`/`reopened`/`merged`
+  were transactional waypoints that never persisted; all write paths now perform a
+  single atomic CAS to the persisted state (`blocked, ready, claimed, halted,
+  verifying, awaiting_approval, closed`). See `docs/migrations/001-enum-collapse-and-pg-schema-parity.md`.
+  Dev DBs re-seed fresh; the demo DB was re-seeded. Rollback = revert + re-seed.
+- `npm run verify:postgres` **30/30** (17 tables FORCE flags + default-deny incl. new tables).
 
 Shipped in Phase 1 (2026-11-27, PR #3):
 - **Incremental `verifyLog` verification cache** — result cached per
