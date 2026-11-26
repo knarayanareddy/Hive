@@ -1,17 +1,15 @@
 export type Trust = "owner" | "member" | "external";
 
 export type TaskState =
+  // 7 observable states. The former 5 transient states (expired, submitted,
+  // merged, rejected, reopened) were written and rewritten within a single
+  // transaction and therefore never persisted; see docs/migrations/001.
   | "blocked"
   | "ready"
   | "claimed"
   | "halted"
-  | "expired"
-  | "submitted"
   | "verifying"
-  | "rejected"
   | "awaiting_approval"
-  | "reopened"
-  | "merged"
   | "closed";
 
 export type GatePolicy = "none" | "one" | "two_of_three";

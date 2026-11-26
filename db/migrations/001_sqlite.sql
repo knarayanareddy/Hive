@@ -68,8 +68,8 @@ CREATE TABLE IF NOT EXISTS task (
   branch_room         TEXT,
   title               TEXT NOT NULL,
   state               TEXT NOT NULL CHECK (state IN (
-    'blocked','ready','claimed','halted','expired','submitted','verifying',
-    'rejected','awaiting_approval','reopened','merged','closed'
+    'blocked','ready','claimed','halted','verifying',
+    'awaiting_approval','closed'
   )),
   owner               TEXT,
   lease_epoch         INTEGER NOT NULL DEFAULT 0,

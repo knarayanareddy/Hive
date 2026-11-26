@@ -220,13 +220,8 @@ const STATE_TONE: Record<string, Tone> = {
   ready: "sky",
   claimed: "amber",
   halted: "rose",
-  expired: "orange",
-  submitted: "violet",
   verifying: "violet",
-  rejected: "rose",
   awaiting_approval: "amber",
-  reopened: "orange",
-  merged: "emerald",
   closed: "emerald",
 };
 

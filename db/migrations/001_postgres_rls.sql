@@ -5,6 +5,11 @@ CREATE TABLE IF NOT EXISTS authority_meta (
   singleton     SMALLINT PRIMARY KEY DEFAULT 1 CHECK (singleton = 1),
   incarnation   UUID NOT NULL DEFAULT gen_random_uuid(),
   gateway_pub   TEXT NOT NULL,
+  -- Custodial gateway signing key, AES-256-GCM encrypted exactly as in SQLite
+  -- (enc:v1:*). Nullable: written post-keygen by the (future) pg runtime; never
+  -- a placeholder value. NOT readable by the least-privilege app role — see grants.
+  gateway_priv  TEXT,
+  sim_now_ms    BIGINT NOT NULL DEFAULT 0,
   rotated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -13,6 +18,9 @@ CREATE TABLE IF NOT EXISTS principal (
   tenant_id        TEXT NOT NULL,
   kind             TEXT NOT NULL CHECK (kind IN ('human', 'agent')),
   pubkey           TEXT NOT NULL,
+  -- Custodial principal private key, AES-256-GCM encrypted (enc:v1:*). Nullable
+  -- pre-custody; never plaintext-at-rest when HIVE_MASTER_KEY is set.
+  privkey          TEXT,
   owner            TEXT,
   harness          TEXT,
   role             TEXT NOT NULL DEFAULT 'member',
@@ -30,10 +38,33 @@ CREATE TABLE IF NOT EXISTS grant_rule (
   tenant_id   TEXT NOT NULL,
   principal   TEXT NOT NULL,
   path        TEXT NOT NULL,
-  can         TEXT[] NOT NULL,
+  can_json    JSONB NOT NULL,
   created_by  TEXT NOT NULL,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, id)
+);
+
+-- Structured-output schema registry (structured schemas feature)
+CREATE TABLE IF NOT EXISTS schema_def (
+  name          TEXT NOT NULL,
+  tenant_id     TEXT NOT NULL,
+  description   TEXT NOT NULL,
+  required_json JSONB NOT NULL,
+  enums_json    JSONB NOT NULL,
+  PRIMARY KEY (tenant_id, name)
+);
+
+-- Branch/room registry (branch-as-room for PR creation)
+CREATE TABLE IF NOT EXISTS channel_room (
+  name        TEXT NOT NULL,
+  tenant_id   TEXT NOT NULL,
+  kind        TEXT NOT NULL CHECK (kind IN ('channel', 'branch')),
+  repo        TEXT,
+  branch      TEXT,
+  origin      TEXT NOT NULL DEFAULT 'hive',
+  created_by  TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS task (
@@ -44,8 +75,8 @@ CREATE TABLE IF NOT EXISTS task (
   branch_room         TEXT,
   title               TEXT NOT NULL,
   state               TEXT NOT NULL CHECK (state IN (
-    'blocked','ready','claimed','halted','expired','submitted','verifying',
-    'rejected','awaiting_approval','reopened','merged','closed'
+    'blocked','ready','claimed','halted','verifying',
+    'awaiting_approval','closed'
   )),
   owner               TEXT,
   lease_epoch         BIGINT NOT NULL DEFAULT 0,
@@ -60,7 +91,7 @@ CREATE TABLE IF NOT EXISTS task (
   protected_path      TEXT,
   gate_policy         TEXT NOT NULL DEFAULT 'none' CHECK (gate_policy IN ('none','one','two_of_three')),
   verified_close      TEXT,
-  labels              JSONB NOT NULL DEFAULT '{}'::jsonb,
+  labels_json         JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, id)
@@ -84,17 +115,20 @@ CREATE TABLE IF NOT EXISTS event (
   actor        TEXT NOT NULL,
   channel      TEXT,
   task_id      TEXT,
-  payload      JSONB NOT NULL,
+  payload_json JSONB NOT NULL,
   trust        TEXT NOT NULL CHECK (trust IN ('owner','member','external')),
-  attest       JSONB NOT NULL DEFAULT '[]'::jsonb,
+  attest_json  JSONB NOT NULL DEFAULT '[]'::jsonb,
   sig          TEXT NOT NULL,
   fts_doc      TSVECTOR GENERATED ALWAYS AS (
-    to_tsvector('english', coalesce(kind,'') || ' ' || coalesce(actor,'') || ' ' || coalesce(channel,'') || ' ' || coalesce(payload::text,''))
+    to_tsvector('english', coalesce(kind,'') || ' ' || coalesce(actor,'') || ' ' || coalesce(channel,'') || ' ' || coalesce(task_id,'') || ' ' || coalesce(payload_json::text,''))
   ) STORED,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_event_fts ON event USING GIN (fts_doc);
+CREATE INDEX IF NOT EXISTS idx_event_tenant_seq ON event (tenant_id, seq);
+CREATE INDEX IF NOT EXISTS idx_event_tenant_ch ON event (tenant_id, channel, seq);
+CREATE INDEX IF NOT EXISTS idx_event_tenant_task ON event (tenant_id, task_id, seq);
 
 CREATE TABLE IF NOT EXISTS checkpoint (
   id            TEXT NOT NULL,
@@ -115,7 +149,7 @@ CREATE TABLE IF NOT EXISTS evidence (
   kind         TEXT NOT NULL,
   head_sha     TEXT NOT NULL,
   lease_epoch  BIGINT NOT NULL,
-  result       JSONB NOT NULL,
+  result_json  JSONB NOT NULL,
   passed       BOOLEAN NOT NULL,
   produced_by  TEXT NOT NULL,
   sandbox_tree TEXT NOT NULL,
@@ -148,9 +182,9 @@ CREATE TABLE IF NOT EXISTS outbox (
   task_id         TEXT,
   lease_epoch     BIGINT,
   effect          TEXT NOT NULL,
-  args            JSONB NOT NULL,
+  args_json       JSONB NOT NULL,
   status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','sent','confirmed','failed')),
-  receipt         JSONB,
+  receipt_json    JSONB,
   attempts        INT NOT NULL DEFAULT 0,
   last_error      TEXT,
   locked_by       TEXT,
@@ -212,7 +246,7 @@ DECLARE
   tbl TEXT;
 BEGIN
   FOREACH tbl IN ARRAY ARRAY[
-    'principal','grant_rule','task','task_dep','event','checkpoint',
+    'principal','grant_rule','schema_def','channel_room','task','task_dep','event','checkpoint',
     'evidence','approval','outbox','wake_queue','read_cursor','call_telemetry','artifact'
   ] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY;', tbl);
@@ -235,6 +269,7 @@ CREATE TABLE IF NOT EXISTS principal_session (
   last_used_at  BIGINT,
   revoked       INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_principal_session_principal ON principal_session(tenant_id, principal_id);
 ALTER TABLE principal_session ENABLE ROW LEVEL SECURITY;
 ALTER TABLE principal_session FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON principal_session;
