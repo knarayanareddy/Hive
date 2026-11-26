@@ -12,7 +12,7 @@ full review in [`ARCHITECTURE_REVIEW.md`](./ARCHITECTURE_REVIEW.md).
 |---|------|--------|------------|
 | 1 | Live GitHub / Slack credentials for outbox effects | OPEN | Needs real credentials (repo + tokens) |
 | 2 | `pg`-backed runtime store for cloud parity | OPEN | Engineering decision + managed Postgres |
-| 3 | Browser-level UI QA (Playwright) | CI job landed (PR #4); NOT yet run | Needs one green CI run |
+| 3 | Browser-level UI QA (Playwright) | Green on PR #4 (run 45827695160) | Drill click-through + tenant-RLS assertions pending |
 | 4 | Deployment activation (single-origin gateway) | OPEN | Gateway host decision + your go-ahead (see note below) |
 
 ---
@@ -110,19 +110,17 @@ allowlist — but GitHub Actions runners can download them, so CI is the natural
 place (or your workstation: `npx playwright install`).
 
 **Status (2026-11-27):** `@playwright/test` added; `e2e/live-hive.spec.ts` +
-`.github/workflows/ci.yml` job `ui-e2e` landed (asserts single-origin SPA headers,
-401-without-session, admin-minted sign-in renders the board with zero page errors).
-NOT executed in the dev sandbox (browser CDN off-egress) — needs one green CI run.
-Remaining for full parity with the old item: drill click-through assertion and
-tenant-switch/RLS assertion in e2e.
+`.github/workflows/ci.yml` job `ui-e2e` is in place and **green on PR #4** (run 45827695160, 42s).
+It caught a real sign-in bug (fixed in 8b7cca2). Remaining for full parity with the old item:
+drill click-through assertion and tenant-switch/RLS assertion in e2e.
 
 **Steps (remaining):**
-1. Watch the first `ui-e2e` run on the Phase-2 PR; fix selectors if needed.
-2. Extend `e2e/live-hive.spec.ts`: run a drill via the terminal → event appears in
+1. Extend `e2e/live-hive.spec.ts`: run a drill via the terminal → event appears in
    the signed-chain tab; tenant switch shows disjoint workspace (globex empty).
+2. Keep `ui-e2e` required before merge on future PRs.
 
 **Acceptance criteria:**
-- [ ] CI green with `ui-e2e` job; artifacts (screenshots) uploaded on failure.
+- [x] CI green with `ui-e2e` job (run 45827695160); screenshots uploaded on failure. [x = job exists and is green; drill click-through still pending]
 - [ ] No console errors on the Live Hive tab boot path.
 - [ ] Drill click-through assertion passes (UI state change == kernel state
       change via `/api/state` comparison).

@@ -317,12 +317,15 @@ checklist inside the repo (Phase 4) — do not revive the zips.
   backoff min(2^n, 60s); DLP/max-attempt rows terminal (8); boot `reconcileOutbox` retained.
   Inline drain kept as CLI fast path (determinism documented). **EffectLedger kept** — live Slack
   has no provider idempotency; deletion deferred to Phase 3 queue worker (deviation documented).
-- **Specs 17 → 32** (`streams`, `outbox.worker`, `artifacts`, `sdk`); **Playwright ui-e2e added to
-  CI** (`ui-e2e` job) — browser CDN is off-egress in the dev sandbox, so **e2e is unverified here**;
-  treat the CI run as the gate.
+- **Specs 17 → 32** (`streams`, `outbox.worker`, `artifacts`, `sdk`); **Playwright ui-e2e in CI**
+  (`ui-e2e` job) — **green on PR #4** (run 45827695160, 42s). It caught a real bug (fixed in 8b7cca2):
+  fresh sign-in never re-pulled `/api/state`/integrations and the SSE effect didn't re-run on session
+  flip, so the board stayed stuck on the connecting card until reload. Locators also made
+  strict-mode-safe (166ec47). Dev sandbox still cannot download browsers; CI is the runner.
 - **DoD status:** `npm test` 32/32 · verify:postgres **28/28** (verify script extended: `artifact`
   added to grants + FORCE-flag + default-deny checks) · drill:backup PASS · build green ·
   smoke-load static+ETag drills PASS · live chaos 10/10 re-verified · 17 → 32 specs.
-- **Honesty ledger for Phase 2:** (1) ui-e2e not executed locally; (2) S3 artifact backend absent;
+- **Honesty ledger for Phase 2:** (1) ui-e2e coverage narrow (headers/401/sign-in/SSE); drill and
+  tenant-RLS e2e assertions pending; (2) S3 artifact backend absent;
   (3) presence/SSE single-process; (4) `/api/state` p95 ~34ms (snapshot memoization not done);
   (5) EffectLedger not deleted (see above); (6) Playwright report uploaded only on CI failure.

@@ -196,10 +196,12 @@ Shipped in Phase 2 (2026-11-27, single-origin serve + streaming + SDK):
   documented residual for silent double-posts. Revisit when the queue worker lands (Phase 3).
 - **UI** — live badge + watcher count in the status bar (SSE-driven), debounced auto-refresh on
   every committed event; single-origin default means no `VITE_HIVE_API_*` needed.
-- **Playwright ui-e2e wired into CI** (`.github/workflows/ci.yml`, job `ui-e2e`): build → gateway →
+- **Playwright ui-e2e in CI** (`.github/workflows/ci.yml`, job `ui-e2e`): build → gateway →
   chromium sign-in against the real kernel (asserts SPA headers, 401-without-session, board renders,
-  zero page errors). **Not executed in this sandbox** (browser CDN is off-egress) — CI is the
-  verification path; do not merge on red e2e.
+  zero page errors, SSE live badge). **Green on PR #4** (run 45827695160, 42s) — after it caught a real
+  bug: fresh sign-in never re-pulled `/api/state` or opened the SSE stream (mount-time calls had 401'd),
+  so the board stayed on the connecting card until reload. Fixed in 8b7cca2. The dev sandbox still cannot
+  download browsers, so CI remains the verification path.
 - `scripts/smoke-load.mjs` gains a single-origin static drill; `npm run serve` documented.
 - New specs: 17 → **32** (`streams`, `outbox.worker`, `artifacts`, `sdk`). Specs pin the sim clock via `tests/_setup.ts`.
 
@@ -284,5 +286,5 @@ Residual, not done (needs real infrastructure / decisions from you):
 - Presence is best-effort in-memory (no cross-node roster); 60s grace covers reconnects only.
 - SSE caps are per-process; a horizontal gateway would need sticky sessions or a bus.
 - No alerting/metrics (`call_telemetry` table is populated; nothing exports it yet).
-- ui-e2e is CI-only (browser download blocked in the dev sandbox); it has not run here.
+- ui-e2e coverage is narrow (headers/401/sign-in render/SSE badge): drill click-through and tenant-RLS assertions in e2e are still TODO. Local sandbox cannot download browsers; CI is the runner.
 - Backup cadence/retention is your job (`VACUUM INTO` snapshots are on-demand only).
