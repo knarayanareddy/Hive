@@ -11,13 +11,15 @@
     "dev": "node scripts/dev.mjs",
     "dev:api": "node --no-warnings --import tsx src/server/index.ts",
     "dev:web": "vite --host 0.0.0.0 --port 5173",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && npm run build:sdk && vite build",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
     "test": "node --no-warnings --import tsx --test tests/*.spec.ts",
     "verify:postgres": "node scripts/verify-postgres-rls.mjs",
     "drill:backup": "node --no-warnings --import tsx scripts/backup-drill.mjs",
     "smoke:load": "node scripts/smoke-load.mjs",
-    "hive": "node --no-warnings --import tsx src/cli/hive.ts"
+    "hive": "node --no-warnings --import tsx src/cli/hive.ts",
+    "build:sdk": "tsc -p tsconfig.sdk.json",
+    "serve": "npm run build && node --no-warnings --import tsx src/server/index.ts"
   },
   "dependencies": {
     "clsx": "2.1.1",
@@ -28,6 +30,7 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
     "@tailwindcss/vite": "4.1.17",
     "@types/node": "22.19.17",
     "@types/pg": "^8.23.1",
@@ -39,5 +42,14 @@
     "tsx": "^4.19.3",
     "typescript": "5.9.3",
     "vite": "7.3.7"
-  }
+  },
+  "exports": {
+    "./sdk": {
+      "types": "./dist-sdk/sdk/index.d.ts",
+      "import": "./dist-sdk/sdk/index.js"
+    }
+  },
+  "files": [
+    "dist-sdk"
+  ]
 }

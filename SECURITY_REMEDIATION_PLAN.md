@@ -40,7 +40,7 @@ Every load-bearing claim below was re-verified against this repository before ac
 
 - `npm test` green — all specs (12 chaos/integration + session/authz/webhooks/custody) pass (updated only where they exercised the
   vulnerable tokenless path) **plus** new specs listed in each phase.
-- `npm run verify:postgres` — 27/27 RLS checks (incl. principal_session + webhook_delivery).
+- `npm run verify:postgres` — 28/28 RLS checks (incl. principal_session + webhook_delivery + artifact).
 - `npm run drill:backup` — all PASS (now including stale-WAL restore drill).
 - Bearer-token matrix re-verified on a live local gateway for `/api/state`, `/api/cli`, `/api/reset`.
 - INFRASTRUCTURE.md states only what is true of the shipped tree.
@@ -173,7 +173,7 @@ coverage caveat. `TODO.md` gh-CLI line → opt-in (`HIVE_GITHUB_USE_GH_CLI=1`). 
 
 **Explicitly deferred:** PG runtime parity (0.7-parity / M1) — lands as Phase 0.5 or first item of
 Phase 1 after the above, since it doubles the review surface; `schema_def`+`channel_room`+type alignment
-+12 specs on PG16 + 29/29 RLS. Enum collapse — dedicated PR (§2.4).
++12 specs on PG16 + 28/28 RLS (as of Phase 2's artifact addition). Enum collapse — dedicated PR (§2.4).
 
 ## 6. Phase 1 — Perimeter, performance, correctness
 Foreign `Host` 421 + 1 MiB cap (from 0.5), per-identity token buckets (6000 req/min, 60 effect calls/min,
@@ -253,7 +253,7 @@ checklist inside the repo (Phase 4) — do not revive the zips.
   tokenless path (`gate.sha.spec.ts` now exercises reject→re-claim→push).
 - **PG RLS parity for the two new tables** landed in `001_postgres_rls.sql`
   (strict `app.tenant_id <> ''` predicate) + `verify-postgres-rls.mjs` covers both
-  (27/27). Full `schema_def`/`channel_room`/`sim_now_ms` PG alignment (M1) remains
+  (28/28). Full `schema_def`/`channel_room`/`sim_now_ms` PG alignment (M1) remains
   Phase 0.5/1 as planned.
 - **Pushed + PR #3 opened 2026-11-26** (https://github.com/knarayanareddy/Hive/pull/3) on explicit user go-ahead. Phase 0 closed.
 
@@ -287,9 +287,42 @@ checklist inside the repo (Phase 4) — do not revive the zips.
   counter survives re-claim/re-epoch). DLP centralization verified: outbox drain →
   `enforceOutboundDlp` pre-send, failures mark row `failed` (specs: `integrations.spec.ts`,
   `ingest.injection.spec.ts`).
-- **New spec count: 17/17 green.** PG RLS 27/27 · `drill:backup` ALL PASS · build green ·
+- **New spec count: 17/17 green (at Phase 1).** PG RLS 28/28 · `drill:backup` ALL PASS · build green ·
   live chaos-run 10/10 (post-v1-hash) · demo DB re-seeded clean.
 - **Verification cache drill** — kernel spec + opt-in `smoke-load.mjs` `HIVE_SMOKE_ALLOW_RESET=1`
   reset drill (passes: incarnation changes, post-reset snapshot verifies).
 - **Executor note:** Phase 1 touches the SQLite open path on every request (`PRAGMA data_version`);
   if the PG runtime lands (Phase 3), replace with `pg_snapshot`/xmin-based invalidation.
+
+### Execution log — Phase 2 (2026-11-27, PR follows)
+
+- **Single-origin serve (decision §2.3)** — gateway serves `dist/` (SPA fallback, immutable
+  `/assets/*`, `no-cache` index, strict CSP + `nosniff`, traversal guard); UI defaults to
+  same-origin; `VITE_HIVE_API_*` reduced to escape hatch; CORS loopback allowlist kept for dev
+  only. `npm run serve` = build + serve. Verified live.
+- **SSE `GET /api/events`** — post-commit fan-out via a store-level commit hook (`tx()` outermost
+  commit flushes; rollback emits nothing); `id: seq`, Last-Event-ID resume, 15s `: ping`,
+  read-scoped per channel, 20 streams/principal, agents 1 live stream (`watch_replaced`),
+  429 past cap. Debounced UI re-fetch on events (250ms) instead of UI surgery.
+- **Presence registry** — 60s grace, heartbeat 15s, `presence` frames + `GET /api/presence`;
+  in-memory/single-process (documented; not multi-node).
+- **Artifact store** — disk, sha256 content-addressed, tenant-scoped index, 0600/0700, DLP scan
+  pre-disk, `sandbox` CSP + `nosniff` on fetch, read-time hash re-verify; S3 deliberately not
+  implemented (untested code rejected; seam `HIVE_ARTIFACT_DIR` documented).
+- **SDK `hive/sdk`** — typed client (`getState/cli/me/presence/artifactPut/Get/events-generator`)
+  + `withLeaseHeartbeat` (hct_ renew every ttl/3; rotation threaded through callback).
+  Emitted to `dist-sdk/` via `npm run build:sdk`; `exports["./sdk"]`. AbortSignal-clean.
+- **Async outbox worker** — `processOutboxPending` every 1s/tenant; ONE atomic claim fence for
+  inline + worker drains (SKIP-LOCKED semantics; PG → `FOR UPDATE SKIP LOCKED`); retryable-failure
+  backoff min(2^n, 60s); DLP/max-attempt rows terminal (8); boot `reconcileOutbox` retained.
+  Inline drain kept as CLI fast path (determinism documented). **EffectLedger kept** — live Slack
+  has no provider idempotency; deletion deferred to Phase 3 queue worker (deviation documented).
+- **Specs 17 → 32** (`streams`, `outbox.worker`, `artifacts`, `sdk`); **Playwright ui-e2e added to
+  CI** (`ui-e2e` job) — browser CDN is off-egress in the dev sandbox, so **e2e is unverified here**;
+  treat the CI run as the gate.
+- **DoD status:** `npm test` 32/32 · verify:postgres **28/28** (verify script extended: `artifact`
+  added to grants + FORCE-flag + default-deny checks) · drill:backup PASS · build green ·
+  smoke-load static+ETag drills PASS · live chaos 10/10 re-verified · 17 → 32 specs.
+- **Honesty ledger for Phase 2:** (1) ui-e2e not executed locally; (2) S3 artifact backend absent;
+  (3) presence/SSE single-process; (4) `/api/state` p95 ~34ms (snapshot memoization not done);
+  (5) EffectLedger not deleted (see above); (6) Playwright report uploaded only on CI failure.

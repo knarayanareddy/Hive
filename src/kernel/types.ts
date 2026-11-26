@@ -275,3 +275,9 @@ export class ValidationError extends HiveError {
     super(422, "UNPROCESSABLE", message);
   }
 }
+
+export class ArtifactCorruptError extends HiveError {
+  constructor(message: string) {
+    super(500, "ARTIFACT_CORRUPT", message);
+  }
+}

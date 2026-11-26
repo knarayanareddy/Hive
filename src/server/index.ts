@@ -19,6 +19,14 @@ import {
   verifySlackWebhook,
 } from "./webhooks";
 import { executeHiveCli } from "../cli/parser";
+import {
+  SseHub,
+  PresenceRegistry,
+  formatSseFrame,
+  formatSseComment,
+  HEARTBEAT_MS,
+  type StreamRecord,
+} from "./streams";
 import { resolveEffectHub, integrationStatus } from "../integrations";
 import {
   FencedError,
@@ -118,15 +126,15 @@ function resetAll() {
 
 const BODY_CAP_BYTES = 1024 * 1024; // 1 MiB
 
-/** Read the raw request body with a hard 1 MiB cap; throws HiveError(413) past the cap. */
-async function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
+/** Read the raw request body with a hard cap; throws HiveError(413) past the cap. */
+async function readRawBody(req: http.IncomingMessage, limitBytes = BODY_CAP_BYTES): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const ch of req) {
     const buf = Buffer.isBuffer(ch) ? ch : Buffer.from(ch);
     total += buf.length;
-    if (total > BODY_CAP_BYTES) {
-      throw new HiveError(413, "BODY_TOO_LARGE", "request body exceeds the 1 MiB cap");
+    if (total > limitBytes) {
+      throw new HiveError(413, "BODY_TOO_LARGE", `request body exceeds the ${Math.floor(limitBytes / (1024 * 1024))} MiB cap`);
     }
     chunks.push(buf);
   }
@@ -493,6 +501,110 @@ function runLiveChaosSuite() {
   return results;
 }
 
+// ── Phase 2: streaming, presence, artifact store, single-origin static ──────
+const sseHub = new SseHub();
+const presence = new PresenceRegistry();
+const ARTIFACT_MAX_BYTES = Number(process.env.HIVE_ARTIFACT_MAX_BYTES ?? 25 * 1024 * 1024);
+const OUTBOX_POLL_MS = Number(process.env.HIVE_OUTBOX_POLL_MS ?? 1000);
+
+const STATIC_DIR = (() => {
+  if (process.env.HIVE_STATIC_DIR === "off") return null;
+  const dir = path.resolve(process.env.HIVE_STATIC_DIR ?? path.join(process.cwd(), "dist"));
+  return fs.existsSync(path.join(dir, "index.html")) ? dir : null;
+})();
+
+const STATIC_MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".txt": "text/plain; charset=utf-8",
+  ".woff2": "font/woff2",
+  ".webmanifest": "application/manifest+json",
+};
+
+/** Single-origin security headers for the static UI (no cross-origin allowances). */
+function staticHeaders(file: string): Record<string, string> {
+  const ext = path.extname(file).toLowerCase();
+  const isAsset = file.includes(`${path.sep}assets${path.sep}`);
+  const isIndex = path.basename(file) === "index.html";
+  return {
+    "Content-Type": STATIC_MIME[ext] ?? "application/octet-stream",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy":
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+    "Cache-Control": isAsset ? "public, max-age=31536000, immutable" : isIndex ? "no-cache" : "public, max-age=3600",
+  };
+}
+
+/** Serve the Vite build; returns true when the request was handled here. */
+function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathname: string): boolean {
+  if (!STATIC_DIR) return false;
+  let rel: string;
+  try {
+    rel = decodeURIComponent(pathname);
+  } catch {
+    res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("bad path");
+    return true;
+  }
+  if (rel.endsWith("/")) rel += "index.html";
+  const root = STATIC_DIR + path.sep;
+  let file = path.resolve(STATIC_DIR, "." + rel);
+  if (file !== STATIC_DIR && !file.startsWith(root)) {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("not found");
+    return true;
+  }
+  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+    if (!path.extname(rel) && path.basename(rel) !== "index.html") {
+      file = path.join(STATIC_DIR, "index.html"); // SPA route fallback
+    } else {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("not found");
+      return true;
+    }
+  }
+  const headers = staticHeaders(file);
+  res.writeHead(200, headers);
+  if (req.method === "HEAD") {
+    res.end();
+    return true;
+  }
+  res.end(fs.readFileSync(file));
+  return true;
+}
+
+/** Fan-out the current presence roster to every live stream in the tenant. */
+function broadcastPresence(tenant: string): void {
+  try {
+    const entries = presence.snapshot(tenant, Date.now());
+    const frame = formatSseFrame(null, "presence", {
+      tenant,
+      watchers: entries.map((e) => ({
+        principalId: e.principalId,
+        kind: e.principalKind,
+        channels: e.channels,
+        taskId: e.taskId,
+        connected: e.disconnectedAt === null,
+        lastSeenAt: e.lastSeenAt,
+      })),
+    });
+    sseHub.broadcast(tenant, frame);
+  } catch (err) {
+    console.error("[hive-presence] broadcast failed:", err instanceof Error ? err.message : err);
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, corsHeaders(req));
@@ -522,6 +634,11 @@ const server = http.createServer(async (req, res) => {
 
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const pathname = url.pathname;
+
+  // Single-origin static UI (GET/HEAD only; /api and webhook POSTs fall through).
+  if ((req.method === "GET" || req.method === "HEAD") && !pathname.startsWith("/api/")) {
+    if (serveStatic(req, res, pathname)) return;
+  }
 
   // Legacy coarse gateway bearer (HIVE_GATEWAY_TOKEN) — kept ONLY as an outer
   // network edge for e.g. reverse proxies; it carries NO principal identity.
@@ -1088,6 +1205,244 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ── Phase 2: SSE event stream ──────────────────────────────────────────
+    if (req.method === "GET" && pathname === "/api/events") {
+      const ctx = resolveContext(req, url);
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "session required" });
+        return;
+      }
+      const tenant = ctx.tenant;
+      const channel = url.searchParams.get("channel");
+      const taskId = url.searchParams.get("taskId");
+      const principal = kernel.getPrincipal(tenant, ctx.actor);
+      const principalKind = principal?.kind ?? "human";
+
+      const canRead = (ch: string | null): boolean => {
+        if (!ch) return true; // tenant-global audit events — same visibility as /api/state
+        return kernel.explainAccess(tenant, ctx.actor, ch, "read").ok;
+      };
+      if (channel && !canRead(channel)) {
+        sendJson(req, res, 403, { ok: false, error: `denied read on ${channel}/` });
+        return;
+      }
+      if (taskId) {
+        const t = kernel.findTask(tenant, taskId);
+        if (!t) {
+          sendJson(req, res, 404, { ok: false, error: `unknown task "${taskId}"` });
+          return;
+        }
+        if (!canRead(t.channel)) {
+          sendJson(req, res, 403, { ok: false, error: `denied read on ${t.channel}/` });
+          return;
+        }
+      }
+
+      // Enforce the stream cap BEFORE opening the response.
+      const streamId = crypto.randomUUID();
+      let lastSeq = Number(req.headers["last-event-id"] ?? url.searchParams.get("lastEventId") ?? "0");
+      if (!Number.isFinite(lastSeq) || lastSeq < 0) lastSeq = 0;
+
+      res.writeHead(200, {
+        ...corsHeaders(req),
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      res.write(formatSseComment("hive event stream"));
+
+      const record: StreamRecord = {
+        id: streamId,
+        tenantId: tenant,
+        principalId: ctx.actor,
+        principalKind,
+        channel,
+        taskId,
+        connectedAt: Date.now(),
+        lastSeenAt: Date.now(),
+        lastSeq,
+        closed: false,
+        close: (frame?: string) => {
+          try {
+            if (frame) res.write(frame);
+          } catch {
+            /* client gone */
+          }
+          try {
+            res.end();
+          } catch {
+            /* already ended */
+          }
+        },
+        send: (frame: string) => {
+          try {
+            res.write(frame);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+      };
+      const { replaced, error } = sseHub.attach(record, Date.now());
+      if (error) {
+        res.write(formatSseFrame(null, "error", { error, retryAfterSeconds: 30 }));
+        res.end();
+        sseHub.detach(record);
+        return;
+      }
+      for (const old of replaced) {
+        console.log(`[hive-sse] agent ${ctx.actor} stream ${old.id.slice(0, 8)} replaced by ${streamId.slice(0, 8)} (watch_replaced sent)`);
+      }
+
+      // Replay missed events (Last-Event-ID → resume), honoring the same read filters.
+      const replay = kernel
+        .listEvents(tenant, { sinceSeq: lastSeq, limit: 200 })
+        .filter((ev) => (!channel || ev.channel === channel) && (!taskId || ev.taskId === taskId) && canRead(ev.channel));
+      for (const ev of replay) {
+        if (ev.seq <= record.lastSeq) continue;
+        res.write(formatSseFrame(ev.seq, "event", ev));
+        record.lastSeq = ev.seq;
+        lastSeq = ev.seq;
+      }
+
+      presence.touch({ tenantId: tenant, principalId: ctx.actor, principalKind, channel, taskId, now: Date.now() });
+      broadcastPresence(tenant);
+      res.write(
+        formatSseFrame(null, "ready", {
+          tenant,
+          principalId: ctx.actor,
+          incarnation: kernel.getIncarnation(),
+          streams: sseHub.count(tenant, ctx.actor),
+          replayed: replay.length,
+        }),
+      );
+
+      // Live fan-out: committed events only (kernel emits post-commit).
+      const channelCache = new Map<string, boolean>();
+      const unsubscribe = kernel.onEvent((ev) => {
+        if (ev.tenantId !== tenant) return;
+        if (ev.seq <= record.lastSeq) return;
+        if (channel && ev.channel !== channel) return;
+        if (taskId && ev.taskId !== taskId) return;
+        if (ev.channel) {
+          let ok = channelCache.get(ev.channel);
+          if (ok === undefined) {
+            ok = kernel.explainAccess(tenant, ctx.actor, ev.channel, "read").ok;
+            channelCache.set(ev.channel, ok);
+          }
+          if (!ok) return;
+        }
+        try {
+          res.write(formatSseFrame(ev.seq, "event", ev));
+          record.lastSeq = ev.seq;
+        } catch {
+          /* client gone; close handler cleans up */
+        }
+      });
+
+      const ping = setInterval(() => {
+        try {
+          res.write(formatSseComment("ping"));
+        } catch {
+          /* close handler cleans up */
+        }
+        presence.touch({ tenantId: tenant, principalId: ctx.actor, principalKind, channel, taskId, now: Date.now() });
+      }, HEARTBEAT_MS);
+
+      req.on("close", () => {
+        clearInterval(ping);
+        unsubscribe();
+        sseHub.detach(record);
+        presence.drop(tenant, ctx.actor, Date.now());
+        broadcastPresence(tenant);
+      });
+      return; // SSE connections stay open
+    }
+
+    // ── Phase 2: presence roster (session required) ────────────────────────
+    if (req.method === "GET" && pathname === "/api/presence") {
+      const ctx = resolveContext(req, url);
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "session required" });
+        return;
+      }
+      const entries = presence.snapshot(ctx.tenant, Date.now());
+      sendJson(req, res, 200, {
+        ok: true,
+        tenant: ctx.tenant,
+        watchers: entries.map((e) => ({
+          principalId: e.principalId,
+          kind: e.principalKind,
+          channels: e.channels,
+          taskId: e.taskId,
+          connected: e.disconnectedAt === null,
+          lastSeenAt: e.lastSeenAt,
+        })),
+      });
+      return;
+    }
+
+    // ── Phase 2: evidence artifact store (sha256-addressed) ────────────────
+    if (req.method === "POST" && pathname === "/api/artifacts") {
+      const ctx = resolveContext(req, url);
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "session required" });
+        return;
+      }
+      const bytes = await readRawBody(req, ARTIFACT_MAX_BYTES).catch((err: unknown) => {
+        const status = err instanceof HiveError ? err.status : 500;
+        sendJson(req, res, status, { ok: false, error: err instanceof Error ? err.message : String(err) });
+        return null;
+      });
+      if (!bytes) return;
+      if (bytes.length === 0) {
+        sendJson(req, res, 400, { ok: false, error: "empty artifact" });
+        return;
+      }
+      const mediaType = String(req.headers["content-type"] ?? "application/octet-stream").slice(0, 100);
+      const evidenceId = url.searchParams.get("evidenceId") ?? undefined;
+      const stored = kernel.storeArtifact(ctx.tenant, { actor: ctx.actor, mediaType, bytes, evidenceId });
+      sendJson(req, res, 200, { ok: true, ...stored, url: `/api/artifacts/${stored.sha256}` });
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/artifacts") {
+      const ctx = resolveContext(req, url);
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "session required" });
+        return;
+      }
+      sendJson(req, res, 200, { ok: true, artifacts: kernel.listArtifacts(ctx.tenant) });
+      return;
+    }
+
+    const artifactMatch = /^\/api\/artifacts\/([a-f0-9]{64})$/.exec(pathname);
+    if ((req.method === "GET" || req.method === "HEAD") && artifactMatch) {
+      const ctx = resolveContext(req, url);
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "session required" });
+        return;
+      }
+      const sha256 = artifactMatch[1];
+      const meta = kernel.getArtifact(ctx.tenant, sha256);
+      if (!meta) {
+        sendJson(req, res, 404, { ok: false, error: "artifact not found" }); // no cross-tenant existence leak
+        return;
+      }
+      const bytes = kernel.readArtifactBytes(ctx.tenant, sha256);
+      res.writeHead(200, {
+        ...corsHeaders(req),
+        "Content-Type": meta.mediaType,
+        "Content-Length": String(bytes.length),
+        "Content-Security-Policy": "sandbox",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, max-age=31536000, immutable",
+      });
+      res.end(req.method === "HEAD" ? undefined : bytes);
+      return;
+    }
+
     sendJson(req, res, 404, { ok: false, error: `route not found: ${pathname}` });
   } catch (err) {
     const status = err instanceof HiveError ? err.status : 500;
@@ -1107,6 +1462,37 @@ for (const tenant of ["acme", "globex"]) {
   }
 }
 
+// Phase 2 outbox worker: fences on the same atomic claim as the inline drain, retries
+// retryable failures with exponential backoff, and never marks DLP-blocked or
+// max-attempts rows as claimable. Set HIVE_OUTBOX_WORKER=0 to disable (tests use the kernel directly).
+if (process.env.HIVE_OUTBOX_WORKER !== "0") {
+  let draining = false;
+  const timer = setInterval(() => {
+    if (draining) return; // never overlap polls
+    draining = true;
+    try {
+      for (const tenant of ["acme", "globex"]) {
+        try {
+          const r = kernel.processOutboxPending(tenant, { limit: 8 });
+          if (r.claimed > 0) {
+            console.log(`[hive-outbox] tenant=${tenant} claimed=${r.claimed} confirmed=${r.confirmed} failed=${r.failed}`);
+          }
+        } catch (err) {
+          console.error(`[hive-outbox] tenant=${tenant} FAILED:`, err instanceof Error ? err.message : err);
+        }
+      }
+      // Presence grace expiry + roster fan-out.
+      const evicted = presence.sweep(Date.now());
+      if (evicted.length > 0) {
+        for (const e of evicted) broadcastPresence(e.tenantId);
+      }
+    } finally {
+      draining = false;
+    }
+  }, OUTBOX_POLL_MS);
+  timer.unref();
+}
+
 server.listen(PORT, HOST, () => {
   const s = integrationStatus();
   console.log(
@@ -1117,5 +1503,11 @@ server.listen(PORT, HOST, () => {
   );
   console.log(
     `[hive-integrations] mode=${s.mode} github=${s.github.mode} [${s.github.detail}] slack=${s.slack.mode} [${s.slack.detail}] gateway=${s.gatewayAuth}`,
+  );
+  console.log(
+    `[hive-static] single-origin UI: ${STATIC_DIR ? `serving ${STATIC_DIR}` : "disabled (no dist/ — run npm run build)"}`,
+  );
+  console.log(
+    `[hive-outbox] worker poll=${OUTBOX_POLL_MS}ms ${process.env.HIVE_OUTBOX_WORKER === "0" ? "(disabled)" : "on"}; SSE /api/events caps: 20/principal, 1 agent stream`,
   );
 });

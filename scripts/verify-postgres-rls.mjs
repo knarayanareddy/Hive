@@ -64,6 +64,7 @@ const RLS_TABLES = [
   "wake_queue",
   "read_cursor",
   "call_telemetry",
+  "artifact",
   "principal_session",
   "webhook_delivery",
 ];
@@ -138,7 +139,7 @@ async function main() {
   const flagOk =
     flags.rows.length === RLS_TABLES.length &&
     flags.rows.every((r) => r.relrowsecurity && r.relforcerowsecurity);
-  check("ENABLE + FORCE ROW LEVEL SECURITY on all 12 tenant tables", flagOk,
+  check("ENABLE + FORCE ROW LEVEL SECURITY on all 15 tenant tables", flagOk,
     flags.rows.map((r) => `${r.relname}:rls=${r.relrowsecurity},force=${r.relforcerowsecurity}`).join(","));
 
   // ── 6. App-role isolation proofs (non-superuser, non-owner) ─────────────

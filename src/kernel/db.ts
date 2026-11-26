@@ -25,6 +25,8 @@ export class HiveStore {
   public db: DatabaseSync;
   public readonly filePath: string;
   private txDepth = 0;
+  /** Post-commit callbacks (SSE fan-out etc.). Run once, after the OUTERMOST commit only — never on rollback. */
+  private commitHooks: { depth: number; cb: () => void }[] = [];
   /**
    * Wall-clock virtual offset (ms). `hive tick --advance` fast-forwards the
    * kernel's perception of "now" without touching wall time; it is process-local
@@ -48,6 +50,17 @@ export class HiveStore {
     this.db.exec("PRAGMA synchronous = NORMAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec(MIGRATION_SQL);
+    // Additive columns for the Phase 2 outbox fence (001_sqlite.sql already carries them
+    // for fresh databases; ALTER keeps pre-Phase-2 databases working).
+    const outboxCols = this.db
+      .prepare("PRAGMA table_info(outbox)")
+      .all() as { name: string }[];
+    if (!outboxCols.some((c) => c.name === "locked_by")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN locked_by TEXT");
+    }
+    if (!outboxCols.some((c) => c.name === "locked_until")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN locked_until INTEGER");
+    }
 
     const existing = this.db
       .prepare("SELECT incarnation FROM authority_meta WHERE singleton = 1")
@@ -226,6 +239,7 @@ export class HiveStore {
 
   public tx<T>(fn: () => T): T {
     if (this.txDepth > 0) {
+      const enterDepth = this.txDepth;
       const sp = `sp_${this.txDepth}`;
       this.txDepth++;
       this.db.exec(`SAVEPOINT ${sp};`);
@@ -238,6 +252,8 @@ export class HiveStore {
         this.db.exec(`ROLLBACK TO SAVEPOINT ${sp};`);
         this.db.exec(`RELEASE SAVEPOINT ${sp};`);
         this.txDepth--;
+        // Discard effects hooks registered inside the rolled-back region.
+        this.commitHooks = this.commitHooks.filter((h) => h.depth <= enterDepth);
         throw err;
       }
     }
@@ -247,11 +263,35 @@ export class HiveStore {
       const res = fn();
       this.db.exec("COMMIT;");
       this.txDepth--;
+      this.flushCommitHooks();
       return res;
     } catch (err) {
       this.db.exec("ROLLBACK;");
       this.txDepth--;
+      this.commitHooks = [];
       throw err;
+    }
+  }
+
+  /** Register a post-commit callback. Outside a transaction it runs immediately. */
+  public onCommit(cb: () => void): void {
+    if (this.txDepth === 0) {
+      cb();
+      return;
+    }
+    this.commitHooks.push({ depth: this.txDepth, cb });
+  }
+
+  private flushCommitHooks(): void {
+    const hooks = this.commitHooks;
+    this.commitHooks = [];
+    for (const h of hooks) {
+      try {
+        h.cb();
+      } catch (err) {
+        // Fan-out listeners must never corrupt a committed tx result.
+        console.error("[hive-store] commit hook failed:", err instanceof Error ? err.message : err);
+      }
     }
   }
 

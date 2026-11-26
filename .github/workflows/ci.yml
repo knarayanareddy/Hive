@@ -16,7 +16,37 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm test   # 12 specs: 10 chaos acceptance + 2 integration (mock GitHub/Slack on 127.0.0.1)
+      - run: npm test   # 32 specs: 10 chaos acceptance + kernel/unit + session/authz/webhooks/custody + streams/outbox/artifacts/SDK
+
+  ui-e2e:
+    runs-on: ubuntu-latest
+    env:
+      HIVE_E2E_ADMIN_TOKEN: e2e-ci-admin-token-0123456789abcdef0123456789abcdef
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Start single-origin gateway (background)
+        run: |
+          HIVE_ADMIN_TOKEN="$HIVE_E2E_ADMIN_TOKEN" HIVE_ENABLE_DEV_DRILLS=1 \
+            node --no-warnings --import tsx src/server/index.ts > gateway.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8787/api/health && exit 0
+            sleep 1
+          done
+          echo "gateway failed to start"; cat gateway.log; exit 1
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
 
   postgres-rls:
     runs-on: ubuntu-latest

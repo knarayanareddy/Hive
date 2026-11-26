@@ -153,9 +153,22 @@ CREATE TABLE IF NOT EXISTS outbox (
   receipt         JSONB,
   attempts        INT NOT NULL DEFAULT 0,
   last_error      TEXT,
+  locked_by       TEXT,
+  locked_until    BIGINT,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (tenant_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS artifact (
+  tenant_id   TEXT NOT NULL,
+  sha256      TEXT NOT NULL,
+  size        BIGINT NOT NULL,
+  media_type  TEXT NOT NULL,
+  created_by  TEXT NOT NULL,
+  evidence_id TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, sha256)
 );
 
 CREATE TABLE IF NOT EXISTS wake_queue (
@@ -200,7 +213,7 @@ DECLARE
 BEGIN
   FOREACH tbl IN ARRAY ARRAY[
     'principal','grant_rule','task','task_dep','event','checkpoint',
-    'evidence','approval','outbox','wake_queue','read_cursor','call_telemetry'
+    'evidence','approval','outbox','wake_queue','read_cursor','call_telemetry','artifact'
   ] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY;', tbl);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY;', tbl);

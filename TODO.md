@@ -12,8 +12,8 @@ full review in [`ARCHITECTURE_REVIEW.md`](./ARCHITECTURE_REVIEW.md).
 |---|------|--------|------------|
 | 1 | Live GitHub / Slack credentials for outbox effects | OPEN | Needs real credentials (repo + tokens) |
 | 2 | `pg`-backed runtime store for cloud parity | OPEN | Engineering decision + managed Postgres |
-| 3 | Browser-level UI QA (Playwright) | OPEN | Browser download outside sandbox allowlist; fine on CI |
-| 4 | Vercel deployment of the static UI + hosted gateway | OPEN | Gateway host decision + Vercel project/env setup |
+| 3 | Browser-level UI QA (Playwright) | CI job landed (PR #4); NOT yet run | Needs one green CI run |
+| 4 | Deployment activation (single-origin gateway) | OPEN | Gateway host decision + your go-ahead (see note below) |
 
 ---
 
@@ -60,7 +60,7 @@ egress allowlist, and no user-provided GitHub repo/token exists here.
 single-writer, local disk. The design's Principle 8 ("same semantics local and
 cloud") wants Postgres 16 + FORCE RLS as the production store, not just as a
 verified schema. The migration and its verifier (`npm run verify:postgres`,
-27/27 checks) are the acceptance gate that already exists.
+28/28 checks) are the acceptance gate that already exists.
 
 **Blocked by:** engineering decision (connection strategy for serverless vs
 long-lived gateway) and a managed Postgres instance.
@@ -90,7 +90,7 @@ long-lived gateway) and a managed Postgres instance.
 
 **Acceptance criteria:**
 - [ ] All 17 specs pass with `HIVE_STORE=postgres`.
-- [ ] `npm run verify:postgres` still 27/27 (unchanged schema semantics).
+- [ ] `npm run verify:postgres` still 28/28 (incl. artifact).
 - [ ] A pre-restore token is rejected after a PITR restore on pg (mirror of
       `authority.pitr.spec.ts`).
 - [ ] One chaos drill (`gate.sha`) executed against the pg backend with logs.
@@ -109,20 +109,17 @@ console errors are unverified.
 allowlist — but GitHub Actions runners can download them, so CI is the natural
 place (or your workstation: `npx playwright install`).
 
-**Steps:**
-1. `npm i -D @playwright/test` + `npx playwright install --with-deps chromium`.
-2. `playwright.config.ts`: start `npm run dev` (or a dedicated preview URL),
-   baseURL `http://localhost:5173`.
-3. Specs (`e2e/live-hive.spec.ts`) to prove the UI talks to the REAL kernel:
-   - page loads without console errors; Live Hive tab renders task list;
-   - `/api/integrations/status` pills render (github/slack modes visible);
-   - click a fault drill (e.g. `drill_zombie`) → lease_epoch banner updates,
-     event appears in the signed-chain tab;
-   - run `/approve 801 --sha 3fa9c1` via the CLI terminal → status flips toward
-     merged/closed; VerifiedClose badge appears;
-   - tenant switch acme→globex shows an empty/disjoint workspace (RLS);
-   - screenshot the board on failure for review.
-4. Add a `ui-e2e` job to `.github/workflows/ci.yml` (runs on PR, chromium only).
+**Status (2026-11-27):** `@playwright/test` added; `e2e/live-hive.spec.ts` +
+`.github/workflows/ci.yml` job `ui-e2e` landed (asserts single-origin SPA headers,
+401-without-session, admin-minted sign-in renders the board with zero page errors).
+NOT executed in the dev sandbox (browser CDN off-egress) — needs one green CI run.
+Remaining for full parity with the old item: drill click-through assertion and
+tenant-switch/RLS assertion in e2e.
+
+**Steps (remaining):**
+1. Watch the first `ui-e2e` run on the Phase-2 PR; fix selectors if needed.
+2. Extend `e2e/live-hive.spec.ts`: run a drill via the terminal → event appears in
+   the signed-chain tab; tenant switch shows disjoint workspace (globex empty).
 
 **Acceptance criteria:**
 - [ ] CI green with `ui-e2e` job; artifacts (screenshots) uploaded on failure.
@@ -133,43 +130,34 @@ place (or your workstation: `npx playwright install`).
 
 ---
 
-## 4 — Vercel deployment of the static UI + hosted gateway
+## 4 — Deployment activation (single-origin gateway)
 
-**Why:** `vercel.json` is ready (Vite preset, `dist` output, SPA rewrites), but
-no deployment exists and the deployed UI cannot work without a publicly reachable
-`/api`. Vercel cannot run the Node gateway + SQLite as-is; it needs item #2's
-pg backend or a long-lived host for the gateway.
+**Why (updated):** Phase 2 (decision §2.3) retired the split "Vercel static UI +
+hosted gateway" topology. The supported shape is ONE origin: the Node gateway
+serves `dist/` + `/api/*` on the same port (`npm run serve`). `vercel.json` remains
+in the repo but reflects the OLD split topology and must not be deployed as-is.
 
-**Blocked by:** gateway host decision; Vercel project creation/env vars need
-your go-ahead (this repo deliberately did not auto-deploy).
+**Blocked by:** gateway host decision (VM / Fly.io / Railway — NOT Vercel
+serverless unless item #2 lands first: SQLite is not serverless-safe); your
+explicit go-ahead (deploy posture; never auto-deployed).
 
 **Steps:**
-1. Host the gateway (choose one):
-   - **Fly.io / Railway / VM**: node gateway + `docker-compose.yml` Postgres 16
-     (or managed pg), env `HIVE_GATEWAY_TOKEN=<random>`, `HIVE_DB_PATH` or
-     `HIVE_STORE=postgres` (item #2), behind TLS; health check `/api/health`.
-   - Vercel serverless is possible ONLY after item #2 (pg store) — SQLite on
-     serverless is ephemeral and single-tenant breaks.
-2. Vercel project (github.com/knarayanareddy/Hive, framework Vite):
-   env `VITE_HIVE_API_BASE=https://<gateway-host>` · `VITE_HIVE_API_TOKEN=<same as HIVE_GATEWAY_TOKEN>`.
-3. `vercel` connector usage (needs explicit go-ahead): `create_project` →
-   `create_env_var` × 2 → `create_deployment` with `git_source` ref
-   `arena/446b8aab-hive` (or `main` once merged).
-4. Wire inbound webhooks LAST (only once the gateway is public): set
-   `HIVE_GITHUB_WEBHOOK_SECRET` / `HIVE_SLACK_SIGNING_SECRET` on the gateway and point
-   the repo/workspace webhook at `/api/webhooks/github` / `/api/webhooks/slack`
-   (HMAC verification + replay window + delivery dedup implemented 2026-11-26).
-   Outbound effects (item #1) don't need webhooks.
-5. Verify: open the deployed URL → pills show `live`; state loads; a drill runs;
-   CORS: gateway must allow the Vercel origin (or same-origin proxy).
+1. Host the gateway as one process: node gateway + volume for `.hive/` (or
+   item #2's pg store), behind TLS; health check `/api/health`.
+2. Env: `HIVE_ADMIN_TOKEN` (≥32 chars) · `HIVE_MASTER_KEY` · `HIVE_ALLOWED_HOSTS` ·
+   optional `HIVE_GATEWAY_TOKEN` edge · `HIVE_CLOCK_MODE=wall` (default).
+3. Webhooks LAST (only once public): `HIVE_GITHUB_WEBHOOK_SECRET` /
+   `HIVE_SLACK_SIGNING_SECRET`; point repo/workspace webhooks at
+   `/api/webhooks/github` / `/api/webhooks/slack`.
+4. If you still want a Vercel-hosted frontend elsewhere, set
+   `VITE_HIVE_API_BASE` at build time (origin only; there is no token variant — see .env.example) — but prefer the
+   single-origin gateway (this repo's tested path).
 
 **Acceptance criteria:**
-- [ ] Deployed URL loads Live Hive and shows real kernel state from the gateway.
-- [ ] `/api/integrations/status` from the UI = expected modes; bearer auth in force.
-- [ ] A read-only smoke (`/api/health`, `/api/state`, one drill) passes from the
-      deployed origin.
-- [ ] Rollback procedure documented (redeploy previous Vercel deployment; gateway
-      reimage from git tag).
+- [ ] Deployed URL loads Live Hive served by the gateway, talks to same-origin `/api/state`.
+- [ ] `/api/integrations/status` shows expected modes; bearer/session auth in force.
+- [ ] Read-only smoke (`/api/health`, `/api/state`, one non-destructive drill) passes.
+- [ ] Rollback procedure documented (redeploy previous gateway image/tag).
 
 ---
 
@@ -178,4 +166,5 @@ your go-ahead (this repo deliberately did not auto-deploy).
 TLS/WAF in front of the gateway, secrets-manager integration, alerting export of
 `call_telemetry`, queue worker for exactly-once Slack delivery, Postgres runtime
 store (item #2 owns this). (GitHub/Slack webhook receivers WITH HMAC verification
-landed 2026-11-26 — HIVE_GITHUB_WEBHOOK_SECRET / HIVE_SLACK_SIGNING_SECRET.)
+landed 2026-11-26 — HIVE_GITHUB_WEBHOOK_SECRET / HIVE_SLACK_SIGNING_SECRET. Phase 2
+(single-origin serve, SSE, presence, artifacts, SDK, outbox worker) landed 2026-11-27.)
