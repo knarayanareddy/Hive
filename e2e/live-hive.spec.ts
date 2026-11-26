@@ -31,9 +31,13 @@ test("sign-in with admin-minted session renders live kernel state (task 801)", a
   await expect(tokenInput).toBeVisible();
   await tokenInput.fill(ADMIN_TOKEN);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  // The kernel board renders from the live gateway.
-  await expect(page.getByText("Authority Kernel")).toBeVisible({ timeout: 10_000 });
-  await expect(page.getByText("Checkout 'Pay now'")).toBeVisible({ timeout: 10_000 });
+  // The board renders from the live gateway. Keep locators strict-mode safe:
+  // several strings ("Authority Kernel", the task title) appear in more than one
+  // panel, so use exact text or .first() deliberately.
+  await expect(page.getByText("Authority Kernel", { exact: true })).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("Checkout 'Pay now' unresponsive on Safari 17.4").first()).toBeVisible({
+    timeout: 10_000,
+  });
   // SSE live badge appears (fetch-stream to /api/events on the same origin).
   await expect(page.getByText(/live/i).first()).toBeVisible({ timeout: 10_000 });
   expect(consoleErrors, "no uncaught page errors on the boot path").toEqual([]);
