@@ -1838,10 +1838,12 @@ export class HiveKernel {
         sha256(`${task.id}:${task.leaseEpoch}:${task.attempt}`).slice(0, 12);
       const now = this.now();
 
+      // 12→7 state collapse: the legacy 'submitted' waypoint was written and
+      // rewritten inside this transaction; the task is observably 'verifying'.
       const res = this.store.db
         .prepare(
           `UPDATE task
-           SET state = 'submitted', head_sha = ?, revision = revision + 1, updated_at = ?
+           SET state = 'verifying', head_sha = ?, revision = revision + 1, updated_at = ?
            WHERE tenant_id = ? AND id = ? AND revision = ? AND lease_epoch = ?`,
         )
         .run(headSha, now, tId, task.id, task.revision, task.leaseEpoch);
@@ -1861,14 +1863,7 @@ export class HiveKernel {
         },
       });
 
-      // Immediately transition submitted -> verifying and wake a non-author verifier
-      this.store.db
-        .prepare(
-          `UPDATE task SET state = 'verifying', revision = revision + 1, updated_at = ?
-           WHERE tenant_id = ? AND id = ?`,
-        )
-        .run(now, tId, task.id);
-
+      // Task is already 'verifying' (single CAS above); wake a non-author verifier.
       const verifier = this.listPrincipals(tId).find(
         (p) =>
           p.id !== task.owner &&
@@ -2018,10 +2013,13 @@ export class HiveKernel {
           });
           return { task: this.getTask(tId, task.id), evidence };
         }
+        // 12→7 collapse: 'rejected' was transient (re-queued atomically in this
+        // transaction); write the persisted outcome directly.
         this.store.db
           .prepare(
             `UPDATE task
-             SET state = 'rejected', attempt = ?, revision = revision + 1, updated_at = ?
+             SET state = 'ready', attempt = ?, owner = NULL, lease_until = NULL,
+                 revision = revision + 1, updated_at = ?
              WHERE tenant_id = ? AND id = ? AND revision = ?`,
           )
           .run(nextAttempt, now, tId, task.id, task.revision);
@@ -2039,15 +2037,6 @@ export class HiveKernel {
             details: resultObj.details,
           },
         });
-
-        // Re-queue rejected -> ready so worker can claim attempt N+1
-        this.store.db
-          .prepare(
-            `UPDATE task
-             SET state = 'ready', owner = NULL, lease_until = NULL, revision = revision + 1, updated_at = ?
-             WHERE tenant_id = ? AND id = ?`,
-          )
-          .run(now, tId, task.id);
 
         if (task.owner) {
           this.enqueueWake(tId, {
@@ -2223,12 +2212,7 @@ export class HiveKernel {
           )
           .run(now, tId, task.id, targetSha);
 
-        this.store.db
-          .prepare(
-            `UPDATE task SET state = 'reopened', revision = revision + 1, updated_at = ?
-             WHERE tenant_id = ? AND id = ?`,
-          )
-          .run(now, tId, task.id);
+        // 12→7 collapse: 'reopened' was transient (re-queued atomically below).
 
         this.appendEvent(tId, {
           kind: "gate.rejected",
@@ -2238,7 +2222,7 @@ export class HiveKernel {
           payload: { headSha: targetSha, comment: params.comment ?? "Changes requested" },
         });
 
-        // Transition reopened -> ready so worker can pick up feedback
+        // awaiting_approval -> ready so the worker can pick up the feedback
         this.store.db
           .prepare(
             `UPDATE task SET state = 'ready', owner = NULL, lease_until = NULL, revision = revision + 1, updated_at = ?
@@ -2447,13 +2431,9 @@ export class HiveKernel {
 
     const now = this.now();
     return this.store.tx(() => {
-      this.store.db
-        .prepare(
-          `UPDATE task SET state = 'merged', revision = revision + 1, updated_at = ?
-           WHERE tenant_id = ? AND id = ?`,
-        )
-        .run(now, tId, task.id);
-
+      // 12→7 collapse: the legacy 'merged' waypoint was written and rewritten
+      // within this transaction; the atomic merge→close CAS below is the only
+      // persisted write. task.merged stays as an audit event.
       this.appendEvent(tId, {
         kind: "task.merged",
         actor: actorId,
@@ -2482,12 +2462,15 @@ export class HiveKernel {
         }),
       ).slice(0, 20);
 
+    // Single atomic CAS straight to 'closed'. Guard on the FRESHEST revision and
+    // require the pre-merge observable states so a concurrent reject/invalidation
+    // between the merge drain and this CAS fails safely (reconcileOutbox re-runs).
     const cur = this.getTask(tenantId, task.id);
     const closeRes = this.store.db
       .prepare(
         `UPDATE task
          SET state = 'closed', verified_close = ?, lease_until = NULL, revision = revision + 1, updated_at = ?
-         WHERE tenant_id = ? AND id = ? AND revision = ? AND state = 'merged'`,
+         WHERE tenant_id = ? AND id = ? AND revision = ? AND state IN ('awaiting_approval', 'verifying')`,
       )
       .run(verifiedClose, now, tId, task.id, cur.revision);
     if (closeRes.changes !== 1) {
@@ -2559,7 +2542,7 @@ export class HiveKernel {
     const stuck = this.store.db
       .prepare(
         `SELECT id, head_sha AS headSha FROM task
-         WHERE tenant_id = ? AND state IN ('awaiting_approval', 'verifying', 'merged')
+         WHERE tenant_id = ? AND state IN ('awaiting_approval', 'verifying')
            AND head_sha IS NOT NULL`,
       )
       .all(tId) as { id: string; headSha: string }[];
@@ -2980,9 +2963,12 @@ export class HiveKernel {
         (t) => t.state === "claimed" && t.leaseUntil !== null && t.leaseUntil <= now,
       );
       for (const t of stale) {
+        // 12→7 collapse: 'expired' was transient; re-queue atomically.
+        // lease_epoch stays at N so next claim bumps to N+1!
         this.store.db
           .prepare(
-            `UPDATE task SET state = 'expired', revision = revision + 1, updated_at = ?
+            `UPDATE task
+             SET state = 'ready', owner = NULL, lease_until = NULL, revision = revision + 1, updated_at = ?
              WHERE tenant_id = ? AND id = ? AND state = 'claimed'`,
           )
           .run(now, tId, t.id);
@@ -2993,14 +2979,6 @@ export class HiveKernel {
           taskId: t.id,
           payload: { previousOwner: t.owner, fencedEpoch: t.leaseEpoch },
         });
-        // Re-queue expired -> ready; lease_epoch stays at N so next claim bumps to N+1!
-        this.store.db
-          .prepare(
-            `UPDATE task
-             SET state = 'ready', owner = NULL, lease_until = NULL, revision = revision + 1, updated_at = ?
-             WHERE tenant_id = ? AND id = ? AND state = 'expired'`,
-          )
-          .run(now, tId, t.id);
         expiredTasks.push(t.id);
       }
 

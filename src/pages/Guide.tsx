@@ -42,8 +42,8 @@ create table task (
   goal_id          text,
   title            text not null,
   state            text not null check (state in
-    ('blocked','ready','claimed','halted','expired','submitted','verifying',
-     'rejected','awaiting_approval','reopened','merged','closed')),
+    ('blocked','ready','claimed','halted','verifying',
+     'awaiting_approval','closed')),          -- 7 observable states
   owner            text,                       -- principal id (claim)
   lease_epoch      bigint not null default 0,  -- fencing token (lease)
   lease_until      timestamptz,
@@ -185,7 +185,7 @@ function guarded(tx: Tx, tok: CapabilityToken, taskId: string) {
     why: "Chat can't close a task. Evidence produced outside the author's tree can.",
     code: `function submit(tx: Tx, tok: CapabilityToken, id: string, evidence: string[]) {
   const t = guarded(tx, tok, id);
-  tx.setState(t, 'submitted'); tx.setState(t, 'verifying');
+  tx.setState(t, 'verifying');                 // single CAS (no transient waypoints)
   wake.enqueue({ principal: pickVerifier(t, { not: t.owner }), task: id, reason: 'verify' });
 }
 
@@ -195,10 +195,10 @@ function verify(tx: Tx, who: Principal, id: string, sha: string, result: 'pass'|
   if (who.id === t.owner) throw new Forbidden('author cannot verify own work');
   const ev = tx.insertEvidence({ task: id, kind: 'repro', head_sha: sha,
     lease_epoch: t.lease_epoch, result, produced_by: who.id });
-  if (result === 'fail') { tx.setState(t, 'rejected'); tx.bumpAttempt(t); return requeue(tx, t); }
+  if (result === 'fail') { tx.bumpAttempt(t); return requeue(tx, t); }   // -> ready (attempt+1)
   const gate = policy.gateFor(t);                // e.g. payments/* needs 1 human
   if (gate) return tx.setState(t, 'awaiting_approval');
-  return tx.setState(t, 'merged');               // via outbox
+  return tx.setState(t, 'closed');               // via outbox merge + VerifiedClose CAS
 }
 
 function close(tx: Tx, id: string) {             // single CAS write
