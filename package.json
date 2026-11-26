@@ -2,7 +2,7 @@
   "name": "hive",
   "private": true,
   "version": "0.1.0",
-  "description": "Hive — Fenced, verified agent coordination plane combining Vercel Board primitives and Buzz signed-event logs",
+  "description": "Hive \u2014 Fenced, verified agent coordination plane combining Vercel Board primitives and Buzz signed-event logs",
   "type": "module",
   "bin": {
     "hive": "./bin/hive.mjs"
@@ -27,6 +27,7 @@
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "tailwind-merge": "3.4.0",
+    "tsx": "^4.19.3",
     "zod": "^3.24.2"
   },
   "devDependencies": {
@@ -39,7 +40,6 @@
     "@vitejs/plugin-react": "5.1.1",
     "pg": "^8.23.1",
     "tailwindcss": "4.1.17",
-    "tsx": "^4.19.3",
     "typescript": "5.9.3",
     "vite": "7.3.7"
   },

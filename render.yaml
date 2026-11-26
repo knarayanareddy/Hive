@@ -1,0 +1,26 @@
+# render.yaml — Hive single-machine deployment (NOT applied; owner's go-ahead required).
+# Render Blueprint: single web service + persistent disk.
+services:
+  - type: web
+    name: hive
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter              # needs always-on; free tier sleeps — unusable for single-writer SQLite
+    healthCheckPath: /api/health
+    disk:
+      name: hive-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HIVE_DB_PATH
+        value: /data/live.db
+      - key: HIVE_ARTIFACT_DIR
+        value: /data/artifacts
+      - key: HIVE_ADMIN_TOKEN
+        generateValue: true    # or set your own: sync false
+      - key: HIVE_MASTER_KEY
+        generateValue: true
+      # - key: HIVE_GITHUB_REPO / HIVE_GITHUB_TOKEN / HIVE_SLACK_WEBHOOK_URL
+      #   — set in the dashboard; never commit values.
