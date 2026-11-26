@@ -19,7 +19,8 @@
     "smoke:load": "node scripts/smoke-load.mjs",
     "hive": "node --no-warnings --import tsx src/cli/hive.ts",
     "build:sdk": "tsc -p tsconfig.sdk.json",
-    "serve": "npm run build && node --no-warnings --import tsx src/server/index.ts"
+    "serve": "npm run build && node --no-warnings --import tsx src/server/index.ts",
+    "drill:stuck-verifier": "node --no-warnings --import tsx scripts/drill-stuck-verifier.mjs"
   },
   "dependencies": {
     "clsx": "2.1.1",

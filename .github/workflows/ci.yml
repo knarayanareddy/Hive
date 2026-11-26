@@ -88,6 +88,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run drill:backup
+      - run: npm run drill:stuck-verifier
 
   postgres-rls:
     runs-on: ubuntu-latest
