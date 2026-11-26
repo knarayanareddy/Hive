@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import {
   attestationPreimage,
   canonicalJson,
@@ -27,6 +29,7 @@ import {
 import { parseSlashCommand } from "./commands";
 import {
   type ApprovalRecord,
+  ArtifactCorruptError,
   type CapabilityClaims,
   type ChannelRoom,
   type CheckpointRecord,
@@ -54,6 +57,8 @@ import {
 
 /** Maximum verify→reject→reclaim attempts before a task is halted by the breaker (across lease epochs). */
 const MAX_ATTEMPTS = 5;
+/** Outbox drain fence: how long a claim holds before another worker may re-claim (SKIP-LOCKED window). */
+const OUTBOX_LOCK_MS = 30_000;
 
 export class HiveKernel {
   public readonly store: HiveStore;
@@ -62,6 +67,9 @@ export class HiveKernel {
   private mutationEpoch = 0;
   private readonly logVerifyCache = new Map<string, LogVerifyResult>();
   private static readonly LOG_VERIFY_CACHE_LIMIT = 32;
+  /** Post-commit event fan-out (SSE streams subscribe here). */
+  private readonly eventListeners = new Set<(ev: EventRecord) => void>();
+  private readonly instanceId = crypto.randomUUID();
 
   constructor(store?: HiveStore, connectors?: EffectConnectorHub) {
     this.store = store ?? new HiveStore(":memory:");
@@ -692,7 +700,7 @@ export class HiveKernel {
       )
       .run(id, tId, params.kind, params.actor, params.channel ?? "", searchableText);
 
-    return {
+    const record: EventRecord = {
       seq,
       tenantId: tId,
       id,
@@ -707,6 +715,25 @@ export class HiveKernel {
       sig,
       createdAt,
     };
+    // Fan out only after the enclosing transaction commits (survives ROLLBACK as silence).
+    this.store.onCommit(() => this.emitEvent(record));
+    return record;
+  }
+
+  /** Subscribe to committed events. Returns an unsubscribe function. */
+  public onEvent(cb: (ev: EventRecord) => void): () => void {
+    this.eventListeners.add(cb);
+    return () => this.eventListeners.delete(cb);
+  }
+
+  private emitEvent(ev: EventRecord): void {
+    for (const cb of this.eventListeners) {
+      try {
+        cb(ev);
+      } catch (err) {
+        console.error("[hive-kernel] event listener failed:", err instanceof Error ? err.message : err);
+      }
+    }
   }
 
   public listEvents(
@@ -2684,7 +2711,7 @@ export class HiveKernel {
     const now = this.now();
     this.store.db
       .prepare(
-        `UPDATE outbox SET status = 'failed', last_error = ?, updated_at = ?
+        `UPDATE outbox SET status = 'failed', last_error = ?, locked_by = NULL, locked_until = NULL, updated_at = ?
          WHERE tenant_id = ? AND idempotency_key = ?`,
       )
       .run(msg, now, tenantId, key);
@@ -2731,13 +2758,47 @@ export class HiveKernel {
       return JSON.parse(row.receipt_json) as Record<string, unknown>;
     }
 
+    // Atomic claim — the ONLY entry into provider I/O. Inline drains (runEffect) and
+    // the background outbox worker fence on the same row update, so an effect is
+    // performed at most once per claim window (SKIP-LOCKED semantics; on Postgres
+    // this becomes SELECT … FOR UPDATE SKIP LOCKED).
+    // Retryable failures (provider/network) are claimable again; terminal failures
+    // (DLP blocks, max-attempts) are never re-claimed.
     const now = this.now();
-    this.store.db
+    const lockUntil = now + OUTBOX_LOCK_MS;
+    const claim = this.store.db
       .prepare(
-        `UPDATE outbox SET attempts = attempts + 1, status = 'sent', updated_at = ?
-         WHERE tenant_id = ? AND idempotency_key = ?`,
+        `UPDATE outbox
+           SET status = 'sent',
+               attempts = attempts + 1,
+               locked_by = ?,
+               locked_until = ?,
+               updated_at = ?
+         WHERE tenant_id = ? AND idempotency_key = ?
+           AND (locked_until IS NULL OR locked_until <= ?)
+           AND (
+             status IN ('pending', 'sent')
+             OR (
+               status = 'failed'
+               AND COALESCE(last_error, '') NOT LIKE 'DLP blocked%'
+               AND COALESCE(last_error, '') <> 'max attempts exceeded'
+             )
+           )`,
       )
-      .run(now, tId, key);
+      .run(this.instanceId, lockUntil, now, tId, key, now);
+    if (Number(claim.changes) === 0) {
+      const fresh = this.store.db
+        .prepare(
+          "SELECT status, receipt_json FROM outbox WHERE tenant_id = ? AND idempotency_key = ?",
+        )
+        .get(tId, key) as { status: string; receipt_json: string | null } | undefined;
+      if (fresh?.status === "confirmed" && fresh.receipt_json) {
+        return JSON.parse(fresh.receipt_json) as Record<string, unknown>;
+      }
+      throw new ConflictError(
+        `effect "${key}" is being drained by another worker or already delivered (status=${fresh?.status ?? "unknown"})`,
+      );
+    }
 
     try {
       // Read-after-write check first so retries after network drops never duplicate!
@@ -2748,7 +2809,8 @@ export class HiveKernel {
       this.store.db
         .prepare(
           `UPDATE outbox
-           SET status = 'confirmed', receipt_json = ?, last_error = NULL, updated_at = ?
+           SET status = 'confirmed', receipt_json = ?, last_error = NULL,
+               locked_by = NULL, locked_until = NULL, updated_at = ?
            WHERE tenant_id = ? AND idempotency_key = ?`,
         )
         .run(canonicalJson(receipt), now, tId, key);
@@ -3349,6 +3411,191 @@ export class HiveKernel {
       sig: r.sig,
       invalidatedAt: r.invalidated_at === null ? null : Number(r.invalidated_at),
       invalidatedReason: r.invalidated_reason,
+      createdAt: Number(r.created_at),
+    }));
+  }
+
+  /* ========================================================================
+   *  ASYNC OUTBOX WORKER (Phase 2) — claims fenced pending/stale-sent rows and drains them
+   * ====================================================================== */
+
+  /**
+   * Process claimable outbox rows (pending, or stale 'sent' past lock expiry) for a tenant.
+   * Called by the server's outbox worker loop and safe to call concurrently with inline
+   * drains — the atomic claim inside drainOutboxEffect is the fence.
+   */
+  public processOutboxPending(
+    tenantId: string,
+    opts?: { limit?: number },
+  ): { claimed: number; confirmed: number; failed: number } {
+    const tId = this.store.assertTenant(tenantId);
+    const limit = Math.max(1, Math.min(opts?.limit ?? 16, 64));
+    const now = this.now();
+    const maxAttempts = Number(process.env.HIVE_OUTBOX_MAX_ATTEMPTS ?? 8);
+
+    // Poison rows: claimable but already exhausted → fail terminally, never call the provider.
+    this.store.db
+      .prepare(
+        `UPDATE outbox
+           SET status = 'failed', last_error = 'max attempts exceeded', updated_at = ?
+         WHERE tenant_id = ? AND status IN ('pending', 'sent') AND attempts >= ?
+           AND COALESCE(last_error, '') NOT LIKE 'DLP blocked%'
+           AND (locked_until IS NULL OR locked_until <= ?)`,
+      )
+      .run(now, tId, maxAttempts, now);
+    // Retryable failures that already exhausted their attempts become terminally marked too.
+    this.store.db
+      .prepare(
+        `UPDATE outbox
+           SET status = 'failed', last_error = 'max attempts exceeded', updated_at = ?
+         WHERE tenant_id = ? AND status = 'failed' AND attempts >= ?
+           AND COALESCE(last_error, '') NOT LIKE 'DLP blocked%'
+           AND COALESCE(last_error, '') <> 'max attempts exceeded'`,
+      )
+      .run(now, tId, maxAttempts);
+
+    const claimable = this.store.db
+      .prepare(
+        `SELECT idempotency_key, status, attempts, updated_at FROM outbox
+         WHERE tenant_id = ?
+           AND attempts < ?
+           AND (locked_until IS NULL OR locked_until <= ?)
+           AND (
+             status IN ('pending', 'sent')
+             OR (
+               status = 'failed'
+               AND COALESCE(last_error, '') NOT LIKE 'DLP blocked%'
+               AND COALESCE(last_error, '') <> 'max attempts exceeded'
+             )
+           )
+         ORDER BY created_at ASC
+         LIMIT ?`,
+      )
+      .all(tId, maxAttempts, now, limit * 4) as {
+        idempotency_key: string;
+        status: string;
+        attempts: number;
+        updated_at: number;
+      }[];
+
+    // Exponential backoff for retryable failed rows (min(2^attempts, 60s)) — provider
+    // outages must not hot-loop the worker. Pending/stale-sent rows drain immediately.
+    const failedBackoffMs = (attempts: number) => Math.min(2 ** Math.max(0, attempts) * 1000, 60_000);
+    const rows = claimable
+      .filter((r) => r.status !== "failed" || r.updated_at + failedBackoffMs(r.attempts) <= now)
+      .slice(0, limit);
+
+    let confirmed = 0;
+    let failed = 0;
+    for (const row of rows) {
+      try {
+        this.drainOutboxEffect(tId, row.idempotency_key, "hive-outbox-worker");
+        confirmed += 1;
+      } catch {
+        failed += 1; // drainOutboxEffect already marked the row failed with the reason
+      }
+    }
+    return { claimed: rows.length, confirmed, failed };
+  }
+
+  /* ========================================================================
+   *  EVIDENCE ARTIFACT STORE (Phase 2) — sha256-addressed, tenant-scoped, disk-backed
+   * ====================================================================== */
+
+  private artifactRoot(): string {
+    return path.resolve(process.env.HIVE_ARTIFACT_DIR ?? path.join(".hive", "artifacts"));
+  }
+
+  /**
+   * Persist an artifact under its sha256 (content-addressed, idempotent). Bytes are DLP-scanned
+   * (best-effort on binary) and written with 0600 inside a 0700 tree. Cross-tenant reads are
+   * refused at the HTTP layer via the artifact row; storage never mixes tenants on disk either
+   * (file name is the content hash; the tenant index lives in SQLite).
+   */
+  public storeArtifact(
+    tenantId: string,
+    params: { actor: string; mediaType: string; bytes: Buffer; evidenceId?: string },
+  ): { sha256: string; size: number; createdAt: number } {
+    const tId = this.store.assertTenant(tenantId);
+    const actor = this.getPrincipal(tId, params.actor);
+    if (!actor) {
+      throw new ForbiddenError(`unknown principal "${params.actor}" in tenant "${tId}"`);
+    }
+    enforceOutboundDlp(params.bytes.toString("utf8"));
+    const sha256 = crypto.createHash("sha256").update(params.bytes).digest("hex");
+    const root = this.artifactRoot();
+    const dir = path.join(root, sha256.slice(0, 2));
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const target = path.join(dir, sha256);
+    if (!fs.existsSync(target)) {
+      fs.writeFileSync(target, params.bytes, { mode: 0o600 });
+    }
+    const now = this.now();
+    this.store.db
+      .prepare(
+        `INSERT OR IGNORE INTO artifact (tenant_id, sha256, size, media_type, created_by, evidence_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(tId, sha256, params.bytes.length, params.mediaType, params.actor, params.evidenceId ?? null, now);
+    this.appendEvent(tId, {
+      kind: "artifact.stored",
+      actor: params.actor,
+      channel: null,
+      taskId: null,
+      payload: { sha256, size: params.bytes.length, mediaType: params.mediaType, evidenceId: params.evidenceId ?? null },
+    });
+    return { sha256, size: params.bytes.length, createdAt: now };
+  }
+
+  public getArtifact(
+    tenantId: string,
+    sha256: string,
+  ): { sha256: string; size: number; mediaType: string; createdBy: string; createdAt: number; evidenceId: string | null } | null {
+    const tId = this.store.assertTenant(tenantId);
+    const row = this.store.db
+      .prepare(
+        "SELECT sha256, size, media_type, created_by, evidence_id, created_at FROM artifact WHERE tenant_id = ? AND sha256 = ?",
+      )
+      .get(tId, sha256) as
+      | { sha256: string; size: number; media_type: string; created_by: string; evidence_id: string | null; created_at: number }
+      | undefined;
+    if (!row) return null;
+    return {
+      sha256: row.sha256,
+      size: Number(row.size),
+      mediaType: row.media_type,
+      createdBy: row.created_by,
+      evidenceId: row.evidence_id,
+      createdAt: Number(row.created_at),
+    };
+  }
+
+  /** Read artifact bytes, re-verifying the content hash (detects disk tampering). */
+  public readArtifactBytes(tenantId: string, sha256: string): Buffer {
+    const row = this.getArtifact(tenantId, sha256);
+    if (!row) throw new ValidationError(`artifact ${sha256} not found`);
+    const file = path.join(this.artifactRoot(), sha256.slice(0, 2), sha256);
+    const bytes = fs.readFileSync(file);
+    const actual = crypto.createHash("sha256").update(bytes).digest("hex");
+    if (actual !== sha256) {
+      throw new ArtifactCorruptError(`artifact ${sha256} failed integrity check (disk tampering suspected)`);
+    }
+    return bytes;
+  }
+
+  public listArtifacts(tenantId: string): Array<{ sha256: string; size: number; mediaType: string; createdBy: string; evidenceId: string | null; createdAt: number }> {
+    const tId = this.store.assertTenant(tenantId);
+    const rows = this.store.db
+      .prepare(
+        "SELECT sha256, size, media_type, created_by, evidence_id, created_at FROM artifact WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 200",
+      )
+      .all(tId) as { sha256: string; size: number; media_type: string; created_by: string; evidence_id: string | null; created_at: number }[];
+    return rows.map((r) => ({
+      sha256: r.sha256,
+      size: Number(r.size),
+      mediaType: r.media_type,
+      createdBy: r.created_by,
+      evidenceId: r.evidence_id,
       createdAt: Number(r.created_at),
     }));
   }

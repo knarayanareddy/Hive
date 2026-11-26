@@ -30,19 +30,18 @@ import { Badge, Btn, Card, Code, SectionTitle, Tabs, type Tone } from "../compon
 import { cn } from "../utils/cn";
 
 /**
- * Deployed-frontend → remote-gateway support.
- * When Hive's static build is hosted somewhere without the Node gateway
- * (e.g. Vercel), set VITE_HIVE_API_BASE to the gateway origin
- * (e.g. https://hive-gateway.example.com) so the UI calls it cross-origin.
- * When the gateway requires HIVE_GATEWAY_TOKEN bearer auth, set
- * VITE_HIVE_API_TOKEN to the same token — it is sent as Authorization: Bearer.
+ * The supported topology (Phase 2, §2.3) is single-origin: the gateway serves
+ * this build itself, so API_BASE is "" and every call is same-origin.
+ * VITE_HIVE_API_BASE remains as an escape hatch for hosting the UI elsewhere
+ * (e.g. static bucket): set it to the gateway ORIGIN (public information).
+ * There is deliberately NO VITE_HIVE_API_TOKEN: a shared bearer baked into a
+ * public bundle is not a credential, it is a leak. Cross-origin sign-in mints
+ * a per-principal session (hst) via the admin token, kept in sessionStorage.
  */
 const API_BASE = (import.meta.env.VITE_HIVE_API_BASE as string | undefined) ?? "";
-const API_TOKEN = (import.meta.env.VITE_HIVE_API_TOKEN as string | undefined) ?? "";
 const HST_KEY = "hive_hst";
 const apiFetch = (input: string, init?: RequestInit) => {
-  const hst = sessionStorage.getItem(HST_KEY);
-  const bearer = hst ?? API_TOKEN;
+  const bearer = sessionStorage.getItem(HST_KEY);
   return fetch(`${API_BASE}${input}`, {
     ...init,
     headers: {
@@ -276,6 +275,30 @@ export default function LiveHivePage() {
     return true;
   }, []);
 
+  const fetchState = useCallback(async (t = tenant) => {
+    const res = await apiFetch(`/api/state?tenant=${encodeURIComponent(t)}`);
+    if (note401(res)) return;
+    const data = (await res.json()) as WorkspaceSnapshot;
+    setSnap(data);
+    const maxSeq = data.events.reduce((m, e) => Math.max(m, e.seq), lastSeqRef.current);
+    lastSeqRef.current = maxSeq;
+  }, [tenant, note401]);
+
+  useEffect(() => {
+    void fetchState(tenant);
+  }, [tenant, fetchState]);
+
+  const loadIntegrations = useCallback(() => {
+    apiFetch("/api/integrations/status")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => setIntegrations((data as IntegrationsStatus | null) ?? null))
+      .catch(() => setIntegrations(null));
+  }, []);
+
+  useEffect(() => {
+    loadIntegrations();
+  }, [loadIntegrations]);
+
   const signIn = useCallback(async () => {
     setSignInError(null);
     const res = await apiFetch("/api/session/mint", {
@@ -297,7 +320,11 @@ export default function LiveHivePage() {
     setAuthBanner(null);
     setSignInOpen(false);
     setSignInAdminToken("");
-  }, [tenant, signInPrincipal, signInAdminToken]);
+    // The mount-time fetchState/integrations calls already ran without a session;
+    // pull both again now that we hold one, or the board stays on the sign-in card.
+    void fetchState(json.tenant ?? tenant);
+    loadIntegrations();
+  }, [tenant, signInPrincipal, signInAdminToken, fetchState, loadIntegrations]);
 
   const signOut = useCallback(async () => {
     try {
@@ -332,23 +359,89 @@ export default function LiveHivePage() {
     [],
   );
 
-  const fetchState = useCallback(async (t = tenant) => {
-    const res = await apiFetch(`/api/state?tenant=${encodeURIComponent(t)}`);
-    if (note401(res)) return;
-    const data = (await res.json()) as WorkspaceSnapshot;
-    setSnap(data);
-  }, [tenant, note401]);
+  const [live, setLive] = useState<{ connected: boolean; watchers: number }>({ connected: false, watchers: 0 });
+  const lastSeqRef = useRef<number>(0);
+  const refreshTimer = useRef<number | null>(null);
+  const scheduleRefresh = useCallback(() => {
+    if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
+    refreshTimer.current = window.setTimeout(() => {
+      void fetchState(tenant);
+    }, 250);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tenant]);
 
+  // Live event stream (SSE via fetch — EventSource cannot send the hst_ bearer).
+  // Debounced state refresh on every committed event; presence frames drive the badge.
   useEffect(() => {
-    void fetchState(tenant);
-  }, [tenant, fetchState]);
-
-  useEffect(() => {
-    apiFetch("/api/integrations/status")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => setIntegrations((data as IntegrationsStatus | null) ?? null))
-      .catch(() => setIntegrations(null));
-  }, []);
+    const hst = sessionStorage.getItem(HST_KEY);
+    if (!session || !hst) {
+      setLive({ connected: false, watchers: 0 });
+      return;
+    }
+    const ctrl = new AbortController();
+    let stopped = false;
+    const run = async () => {
+      while (!stopped) {
+        try {
+          const last = lastSeqRef.current > 0 ? `&lastEventId=${lastSeqRef.current}` : "";
+          const res = await fetch(`${API_BASE}/api/events?tenant=${encodeURIComponent(tenant)}${last}`, {
+            headers: { Authorization: `Bearer ${hst}`, Accept: "text/event-stream" },
+            signal: ctrl.signal,
+          });
+          if (!res.ok || !res.body) {
+            setLive((l) => ({ ...l, connected: false }));
+            await new Promise((r) => setTimeout(r, 3000));
+            continue;
+          }
+          setLive((l) => ({ ...l, connected: true }));
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let idx: number;
+            while ((idx = buf.indexOf("\n\n")) >= 0) {
+              const raw = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
+              let event: string | null = null;
+              let data = "";
+              for (const line of raw.split("\n")) {
+                if (line.startsWith("event:")) event = line.slice(6).trim();
+                else if (line.startsWith("data:")) data += line.slice(5).trim();
+              }
+              if (!data) continue;
+              try {
+                const parsed = JSON.parse(data) as Record<string, unknown>;
+                if (event === "event" && typeof parsed.seq === "number") {
+                  lastSeqRef.current = Math.max(lastSeqRef.current, parsed.seq);
+                  scheduleRefresh();
+                } else if (event === "presence" && Array.isArray(parsed.watchers)) {
+                  setLive((l) => ({ ...l, watchers: (parsed.watchers as unknown[]).length }));
+                } else if (event === "watch_replaced" || event === "error") {
+                  setLive((l) => ({ ...l, connected: false }));
+                }
+              } catch {
+                /* skip malformed frame */
+              }
+            }
+          }
+          setLive((l) => ({ ...l, connected: false }));
+        } catch (err) {
+          if (ctrl.signal.aborted || stopped) break;
+          setLive((l) => ({ ...l, connected: false }));
+          await new Promise((r) => setTimeout(r, 3000));
+        }
+      }
+    };
+    void run();
+    return () => {
+      stopped = true;
+      ctrl.abort();
+      if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
+    };
+  }, [tenant, scheduleRefresh, session]);
 
   useEffect(() => {
     termRef.current?.scrollTo({ top: 1e6, behavior: "smooth" });
@@ -585,6 +678,11 @@ export default function LiveHivePage() {
             <Badge tone="zinc">
               <Database size={10} /> inc:{snap.incarnation.slice(0, 8)}
             </Badge>
+            <span title={live.connected ? `SSE stream live — ${live.watchers} watcher(s) in the 60s grace window` : "SSE stream offline (reconnecting…)"}>
+              <Badge tone={live.connected ? "emerald" : "zinc"}>
+                <Zap size={10} /> {live.connected ? `live${live.watchers > 0 ? ` · ${live.watchers}` : ""}` : "reconnecting…"}
+              </Badge>
+            </span>
             {integrations && (
               <>
                 <span title={integrations.github.detail}>

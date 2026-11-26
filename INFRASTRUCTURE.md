@@ -1,7 +1,7 @@
 # Hive — Infrastructure & Integration Runbook
 
 Status of every item from the post-build review, what was done, what is
-**verified**, and what you must supply. Last updated: 2026-11-25.
+**verified**, and what you must supply. Last updated: 2026-11-27.
 
 > **Tracked work:** the open items in this file are actionable backlog in [`TODO.md`](./TODO.md).
 
@@ -13,8 +13,8 @@ Status of every item from the post-build review, what was done, what is
   wheel, unix socket) and exercised by `scripts/verify-postgres-rls.mjs`, which:
   recreates a throwaway database (`hive_rls_verify`, dropped afterwards), applies the
   migration twice (idempotent), grants least-privilege rights to a **non-superuser**
-  role `hive_rls_app`, seeds two tenants, and asserts **27/27 checks**:
-  ENABLE + FORCE RLS on all 14 tenant tables, default-deny (unset *and* empty
+  role `hive_rls_app`, seeds two tenants, and asserts **28/28 checks** (incl. the `artifact` table):
+  ENABLE + FORCE RLS on all 15 tenant tables, default-deny (unset *and* empty
   `app.tenant_id`), cross-tenant SELECT/UPDATE/DELETE isolation, `WITH CHECK` insert
   denial, FTS5/GIN `tsvector` scoping, and read-only `authority_meta` bootstrap.
 - **Run it yourself:** `docker compose up -d postgres` then
@@ -142,6 +142,69 @@ Shipped and verified in this pass (2026-11-26):
   (`HIVE_ALLOWED_HOSTS`, `GET /api/health` exempt) + CORS restricted to loopback
   origins (or `HIVE_ALLOWED_ORIGINS`), `Authorization` in Allow-Headers.
 
+Shipped in Phase 2 (2026-11-27, single-origin serve + streaming + SDK):
+- **Single-origin topology (decision §2.3)** — the Node gateway now serves the Vite build
+  from `dist/` (`HIVE_STATIC_DIR`, default `./dist`; `off` disables): same-origin API + UI on
+  one port, SPA fallback for client routes, immutable caching for hashed `/assets/*`,
+  `no-cache` index.html, `nosniff` + strict CSP (`default-src 'self'`) on every static
+  response, path-traversal guard (403/404), `X-Forwarded-*` untouched. CORS complexity is
+  now a no-op for the primary topology (the loopback allowlist remains for dev);
+  `VITE_HIVE_API_BASE` is a documented (origin-only) escape hatch; `VITE_HIVE_API_TOKEN` was REMOVED — never bake a shared bearer into a public bundle.
+  `npm run serve` builds and serves the whole product on :8787. Verified live: `/` 200 with
+  CSP + nosniff, SPA fallback, traversal → 404, `/api/state` still 401 without a session.
+- **SSE stream `GET /api/events`** — committed events only (fan-out happens post-commit via
+  a store-level commit hook; rolled-back transactions emit nothing). Frames: `id: <seq>` +
+  `event: event|ready|presence|watch_replaced|error`, `: ping` heartbeat every 15s, replay via
+  `Last-Event-ID` header or `?lastEventId=` (resume after disconnect). Read-scoped per channel
+  (`explainAccess … 'read'`), null-channel audit events visible to all tenant sessions (same
+  visibility as `/api/state`). Caps: 20 streams/principal (429 past that, checked before the
+  response opens), **agents: 1 live stream** — a new agent stream closes the old one with a
+  `watch_replaced` frame. Verified live (curl): replay, live delivery (seq 31), agent replace,
+  resume-from-seq. **Deliberate deviation:** non-goal to migrate the UI off request/response —
+  the UI subscribes and debounce-refetches state (250ms), which is simpler and keeps the kernel
+  response contract unchanged; events arrive with <100ms latency into that render.
+- **Presence registry (60s grace)** — join/heartbeat(15s)/drop semantics; disconnected entries
+  persist 60s for reconnect tolerance; swept by the outbox worker tick; fan-out as `presence`
+  frames + `GET /api/presence` (session required). Entries listed as `connected: false` during
+  grace (verified live).
+- **Evidence artifact store** — `POST /api/artifacts` (raw bytes ≤ 25 MiB, `HIVE_ARTIFACT_MAX_BYTES`),
+  content-addressed by sha256 (`INSERT OR IGNORE` dedupe), stored `.hive/artifacts/<xx>/<sha256>`
+  with 0700/0600, DLP-scanned before hitting disk (secret-shaped bytes refused with 403),
+  tenant-scoped index in SQLite (`artifact` table, RLS-forced in PG),
+  `GET /api/artifacts[/<sha256>]` served with `Content-Security-Policy: sandbox` + `nosniff` +
+  immutable cache; every read re-verifies the content hash (tamper → 500 ARTIFACT_CORRUPT).
+  **S3 backend via `aws4fetch` not included** — the seam (`HIVE_ARTIFACT_DIR`) is documented;
+  untested S3 code was rejected. Verified live: upload → head/get/list roundtrip.
+- **Typed SDK `hive/sdk`** — `src/sdk/index.ts` → `dist-sdk/sdk/` via `npm run build:sdk`
+  (`package.json` `exports["./sdk"]`). `HiveClient` with typed methods (`getState`, `cli`,
+  `me`, `presence`, `artifactPut/Get`, async-generator `events()` consuming SSE with
+  `Last-Event-ID` resume) and `withLeaseHeartbeat` (renews `hct_` every ttl/3 via the kernel
+  renew path; renewal rotates the token; hook-driven, not prompt-driven). AbortSignal-safe.
+  32/32 specs green incl. stubbed-fetch SSE parsing specs. Live smoke: me/state/artifact roundtrip OK.
+- **Async outbox worker** — `processOutboxPending` per tenant every `HIVE_OUTBOX_POLL_MS` (1s):
+  atomic claim (`UPDATE … SET status='sent', locked_by, locked_until WHERE … locked_until <= now`) —
+  the *same* fence guards the inline drain, so a provider call happens at most once per claim
+  window (SKIP-LOCKED semantics; on Postgres this becomes `FOR UPDATE SKIP LOCKED`).
+  Retryable failures re-drain with exponential backoff (min(2^attempts, 60s)); DLP-blocked and
+  max-attempts rows (default 8, `HIVE_OUTBOX_MAX_ATTEMPTS`) are terminal and never re-claimed.
+  Inline drain kept as the CLI's deterministic fast path. Boot `reconcileOutbox` stays as the
+  merged→closed safety net. Verified by `tests/outbox.worker.spec.ts` (crash-staged retry without
+  duplicate PR, DLP terminality, attempt ceiling, lock fencing).
+- **EffectLedger kept (deliberate deviation)** — Phase 0 planned its removal in Phase 2; live Slack
+  still has no provider-side idempotency, and `findExisting('post-slack')` depends on the ledger
+  when the marker search is unavailable (webhook transport). Deleting it now would trade a known,
+  documented residual for silent double-posts. Revisit when the queue worker lands (Phase 3).
+- **UI** — live badge + watcher count in the status bar (SSE-driven), debounced auto-refresh on
+  every committed event; single-origin default means no `VITE_HIVE_API_*` needed.
+- **Playwright ui-e2e in CI** (`.github/workflows/ci.yml`, job `ui-e2e`): build → gateway →
+  chromium sign-in against the real kernel (asserts SPA headers, 401-without-session, board renders,
+  zero page errors, SSE live badge). **Green on PR #4** (run 45827695160, 42s) — after it caught a real
+  bug: fresh sign-in never re-pulled `/api/state` or opened the SSE stream (mount-time calls had 401'd),
+  so the board stayed on the connecting card until reload. Fixed in 8b7cca2. The dev sandbox still cannot
+  download browsers, so CI remains the verification path.
+- `scripts/smoke-load.mjs` gains a single-origin static drill; `npm run serve` documented.
+- New specs: 17 → **32** (`streams`, `outbox.worker`, `artifacts`, `sdk`). Specs pin the sim clock via `tests/_setup.ts`.
+
 Shipped in Phase 1 (2026-11-27, PR #3):
 - **Incremental `verifyLog` verification cache** — result cached per
   `(tenant, selector, resolved checkpoint, mutationEpoch, incarnation, PRAGMA data_version)`;
@@ -215,7 +278,13 @@ Residual, not done (needs real infrastructure / decisions from you):
   it is not a substitute for treating the SQLite file as trusted single-process state.
 - Event-id format v1 is a one-way door: old databases fail `verifyLog` (see above).
 - No secrets manager integration (Vault/SM/Doppler); env vars + KMS-backed key custody options.
-- No queue worker for exactly-once external effects (Slack gap, see §2).
-- No `pg`-backed runtime store (see §1); SQLite is single-process.
+- No queue worker for exactly-once external effects (Slack gap, see §2) — Phase 2 added the
+  fenced outbox *drain* worker; Slack exactly-once additionally needs provider-side read-back
+  or a real queue (Phase 3), and the EffectLedger remains load-bearing meanwhile.
+- No `pg`-backed runtime store (see §1); SQLite is single-process. SSE/presence/Artifact indexes
+  are process-local (presence) or SQLite (artifact) — fine single-machine, not for multi-node.
+- Presence is best-effort in-memory (no cross-node roster); 60s grace covers reconnects only.
+- SSE caps are per-process; a horizontal gateway would need sticky sessions or a bus.
 - No alerting/metrics (`call_telemetry` table is populated; nothing exports it yet).
+- ui-e2e coverage is narrow (headers/401/sign-in render/SSE badge): drill click-through and tenant-RLS assertions in e2e are still TODO. Local sandbox cannot download browsers; CI is the runner.
 - Backup cadence/retention is your job (`VACUUM INTO` snapshots are on-demand only).

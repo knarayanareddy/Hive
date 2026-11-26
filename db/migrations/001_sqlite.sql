@@ -181,9 +181,22 @@ CREATE TABLE IF NOT EXISTS outbox (
   receipt_json    TEXT,
   attempts        INTEGER NOT NULL DEFAULT 0,
   last_error      TEXT,
+  locked_by       TEXT,
+  locked_until    INTEGER,
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL,
   PRIMARY KEY (tenant_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS artifact (
+  tenant_id   TEXT NOT NULL,
+  sha256      TEXT NOT NULL,
+  size        INTEGER NOT NULL,
+  media_type  TEXT NOT NULL,
+  created_by  TEXT NOT NULL,
+  evidence_id TEXT,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, sha256)
 );
 
 CREATE TABLE IF NOT EXISTS wake_queue (

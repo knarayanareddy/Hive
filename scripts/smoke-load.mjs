@@ -92,6 +92,24 @@ let errors = 0;
 errors += await run("/api/health", "/api/health ", {});
 errors += await run("/api/state", "/api/state  ", stateHeaders);
 
+// ── single-origin static drill (${'`'}GET / must serve the Vite build${'`'}) ──
+{
+  const res = await fetch(`${base}/`);
+  const body = await res.text();
+  const csp = res.headers.get("content-security-policy");
+  const nosniff = res.headers.get("x-content-type-options");
+  const isHtml = (res.headers.get("content-type") ?? "").includes("text/html");
+  const hasBundle = /assets\/index-[^"]+\.js/.test(body);
+  if (res.status === 200 && isHtml && hasBundle && csp && nosniff === "nosniff") {
+    console.log("static drill: 200 text/html + CSP + nosniff ✓");
+  } else if (res.status === 404) {
+    console.log("static drill: no SPA served (dist/ missing or HIVE_STATIC_DIR=off) — skipping");
+  } else {
+    console.error(`static drill: FAILED status=${res.status} html=${isHtml} bundle=${hasBundle} csp=${Boolean(csp)} nosniff=${nosniff}`);
+    errors += 1;
+  }
+}
+
 // ── ETag / 304 drill (no mutation) ──────────────────────────────────────────
 {
   const first = await hit("/api/state", stateHeaders);

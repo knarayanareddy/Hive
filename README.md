@@ -27,11 +27,17 @@ Open infrastructure items live in [`TODO.md`](./TODO.md); infrastructure runbook
 # Install dependencies
 npm install
 
-# Run all 12 acceptance specs (10 chaos + 2 live-integration against mock GitHub/Slack)
+# Run all 32 specs (10 chaos + integration + session/authz/webhooks/custody + streams/outbox/artifacts/SDK)
 npm test
 
-# Start the HTTP Authority Server (port 8787) + Vite Web UI (port 5173)
+# Development: HTTP Authority Server (port 8787) + Vite dev UI with proxy (port 5173)
 npm run dev
+
+# Single-origin production topology: the gateway serves the Vite build from dist/
+npm run serve    # = npm run build && node --import tsx src/server/index.ts  (UI + API on :8787)
+
+# Typed SDK (import { HiveClient } from "hive/sdk") — build artifacts in dist-sdk/
+npm run build:sdk
 
 # Type-check & build production bundle
 npm run build
