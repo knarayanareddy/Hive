@@ -54,7 +54,7 @@ into the **same** outbox path the 10 chaos specs exercise:
   post/replay, ledger read-back, DLP failure marking (`sk_live_*` blocked, outbox row
   `failed`, zero side effect), and `HIVE_INTEGRATIONS` mode resolution.
 - **To go live, you must supply** (see `.env.example`): `HIVE_GITHUB_REPO=owner/name`
-  + `HIVE_GITHUB_TOKEN` (or run `gh auth login` — the server auto-reads `gh auth token`)
+  + `HIVE_GITHUB_TOKEN` (or set `HIVE_GITHUB_USE_GH_CLI=1` to opt into reading `gh auth token`)
   and/or `HIVE_SLACK_WEBHOOK_URL` (or bot token + channel). Then restart; boot log
   prints `[hive-integrations] …` with the resolved mode for each category, and the
   **Live Hive** page shows `github:live` / `slack:live` pills (top status bar).
@@ -112,15 +112,20 @@ Shipped and verified in this pass:
 - **Gateway auth**: `HIVE_GATEWAY_TOKEN` — when set, all `/api/*` except
   `GET /api/health` require `Authorization: Bearer <token>` (verified live:
   401 without/with wrong token, 200 with, health stays open). UI sends the token
-  when `VITE_HIVE_API_TOKEN` is set; 401s surface as empty/error UI states.
+  when `VITE_HIVE_API_TOKEN` is set; note: the UI currently does **not** check
+  `res.ok`, so a 401 renders a blank/error surface instead of an explicit auth banner —
+  tracked in `SECURITY_REMEDIATION_PLAN.md` (Phase 3, H6) and scheduled there.
 - **Backup/PITR drill**: `npm run drill:backup` — seed → claim → snapshot → mutate →
   restore against real DB files; asserts incarnation rotation, pre-restore token
   rejection, `FTS5` survival, hash-chain verification. **All 6 checks pass.**
 - **Load canary**: `npm run smoke:load` — 512 requests at concurrency 32:
   `/api/health` p50 ≈ 8ms; `/api/state` p50 ≈ 86ms, p95 ≈ 168ms (it re-verifies the
   full signed log + checkpoint per call by design — cache this before internet-scale).
-- **Secrets**: `.env.example` documents every variable; `.gitignore` covers `.env*`;
-  no tokens are read from the repo. `integrationStatus()` never emits secret values.
+- **Secrets**: `.env.example` is committed (`.gitignore` allows it via `!.env.example`) and
+  documents every variable; no tokens are read from the repo; `.hive/` (live DB, WAL, ledger)
+  and `*.db*` are git-ignored; `integrationStatus()` never emits secret values.
+  (Two earlier drafts of this section claimed these without the `!.env.example` exception
+  being present — corrected 2026-11-26.)
 - **CI**: `.github/workflows/ci.yml` — `npm ci → build → test` (12 specs) +
   Postgres 16 RLS verification job.
 

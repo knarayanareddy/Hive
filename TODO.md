@@ -32,7 +32,8 @@ egress allowlist, and no user-provided GitHub repo/token exists here.
    history you care about — e.g. a scratch org repo).
 2. Create a fine-grained PAT scoped to that repo: `Contents: write`,
    `Pull requests: write`, `Issues: write`. Or run `gh auth login` — the server
-   auto-reads `gh auth token` (disable with `HIVE_GITHUB_USE_GH_CLI=0`).
+   reads `HIVE_GITHUB_TOKEN` from the env; set `HIVE_GITHUB_USE_GH_CLI=1` to opt into the
+   `gh auth token` fallback (off by default).
 3. For Slack: create an *incoming webhook* bound to the target channel
    (simplest, no scopes to review) or a bot token with `chat:write`.
 4. Set and restart (see `.env.example`):
