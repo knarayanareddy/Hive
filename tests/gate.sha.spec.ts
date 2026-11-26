@@ -1,3 +1,4 @@
+import "./_setup";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { HiveKernel } from "../src/kernel/authority";
@@ -72,16 +73,33 @@ test("gate.sha.spec — SHA-bound approvals enforce human sign-off, reject agent
   });
   assert.equal(app1.gateSatisfied, true);
 
-  // New commit pushed after approval -> invalidates prior approval AND requires re-verification of 99b2e0!
+  // Human requests changes -> task returns to ready, the 3fa9c1 approvals are invalidated
+  kernel.decideGate(DEFAULT_TENANT, {
+    actor: "ana",
+    taskId: "801",
+    headSha: "3fa9c1",
+    decision: "reject",
+    comment: "one more Safari 16 guard please",
+  });
+
+  // Re-claim and push the new commit -> approval for 3fa9c1 must not carry over to 99b2e0!
+  const claim2 = kernel.claimTask(DEFAULT_TENANT, { taskId: "801", actor: "fixer" });
   const afterPush = kernel.pushPatch(DEFAULT_TENANT, {
     taskId: "801",
     headSha: "99b2e0",
     diff: "+ form.requestSubmit(); // extra Safari 16 guard",
-    actor: "fixer",
+    token: claim2.token,
   });
-  assert.equal(afterPush.state, "verifying");
+  assert.equal(afterPush.state, "claimed");
   assert.notEqual(kernel.listApprovals(DEFAULT_TENANT, "801")[0].invalidatedAt, null);
   assert.equal(kernel.isMergeAllowed(DEFAULT_TENANT, "801").allowed, false);
+
+  kernel.submitTask(DEFAULT_TENANT, {
+    taskId: "801",
+    token: claim2.token,
+    headSha: "99b2e0",
+    evidenceRefs: ["pr:4412", "ci:14/14"],
+  });
 
   // Re-verify 99b2e0 -> still blocked until fresh human approval on 99b2e0!
   kernel.verifyTask(DEFAULT_TENANT, {

@@ -220,3 +220,23 @@ CREATE TABLE IF NOT EXISTS call_telemetry (
   call_sig        TEXT NOT NULL,
   created_at      INTEGER NOT NULL
 );
+
+-- Principal sessions (per-principal HTTP identity; replaces shared bearer for actions)
+CREATE TABLE IF NOT EXISTS principal_session (
+  token_hash    TEXT PRIMARY KEY,
+  tenant_id     TEXT NOT NULL,
+  principal_id  TEXT NOT NULL,
+  created_at    INTEGER NOT NULL,
+  expires_at    INTEGER NOT NULL,
+  last_used_at  INTEGER,
+  revoked       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_principal_session_principal ON principal_session(tenant_id, principal_id);
+
+-- Inbound webhook replay deduplication
+CREATE TABLE IF NOT EXISTS webhook_delivery (
+  delivery_id   TEXT PRIMARY KEY,
+  tenant_id     TEXT NOT NULL,
+  source        TEXT NOT NULL,
+  received_at   INTEGER NOT NULL
+);

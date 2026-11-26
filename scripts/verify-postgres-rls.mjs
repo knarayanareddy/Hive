@@ -64,6 +64,8 @@ const RLS_TABLES = [
   "wake_queue",
   "read_cursor",
   "call_telemetry",
+  "principal_session",
+  "webhook_delivery",
 ];
 
 const results = [];

@@ -39,14 +39,18 @@ import { cn } from "../utils/cn";
  */
 const API_BASE = (import.meta.env.VITE_HIVE_API_BASE as string | undefined) ?? "";
 const API_TOKEN = (import.meta.env.VITE_HIVE_API_TOKEN as string | undefined) ?? "";
-const apiFetch = (input: string, init?: RequestInit) =>
-  fetch(`${API_BASE}${input}`, {
+const HST_KEY = "hive_hst";
+const apiFetch = (input: string, init?: RequestInit) => {
+  const hst = sessionStorage.getItem(HST_KEY);
+  const bearer = hst ?? API_TOKEN;
+  return fetch(`${API_BASE}${input}`, {
     ...init,
     headers: {
       ...(init?.headers ?? {}),
-      ...(API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}),
+      ...(bearer ? { Authorization: `Bearer ${bearer}` } : {}),
     },
   });
+};
 
 interface IntegrationsStatus {
   mode: string;
@@ -256,7 +260,70 @@ export default function LiveHivePage() {
   const [chaosResults, setChaosResults] = useState<ChaosResult[] | null>(null);
   const [inspectEvent, setInspectEvent] = useState<EventRecord | null>(null);
   const [integrations, setIntegrations] = useState<IntegrationsStatus | null>(null);
+  const [session, setSession] = useState<{ principalId: string; tenant: string } | null>(null);
+  const [authBanner, setAuthBanner] = useState<string | null>(null);
+  const [signInOpen, setSignInOpen] = useState(false);
+  const [signInPrincipal, setSignInPrincipal] = useState("ana");
+  const [signInAdminToken, setSignInAdminToken] = useState("");
+  const [signInError, setSignInError] = useState<string | null>(null);
   const termRef = useRef<HTMLDivElement>(null);
+
+  const note401 = useCallback((res: Response): boolean => {
+    if (res.status !== 401) return false;
+    sessionStorage.removeItem(HST_KEY);
+    setSession(null);
+    setAuthBanner("Session required or expired — sign in (top right) or set HIVE_DEV_INSECURE_ACTOR=1 for the local demo.");
+    return true;
+  }, []);
+
+  const signIn = useCallback(async () => {
+    setSignInError(null);
+    const res = await apiFetch("/api/session/mint", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(signInAdminToken ? { Authorization: `Bearer ${signInAdminToken}` } : {}),
+      },
+      body: JSON.stringify({ tenant, principalId: signInPrincipal }),
+    });
+    const json = (await res.json()) as { ok: boolean; token?: string; principalId?: string; tenant?: string; error?: string };
+    if (!res.ok || !json.token) {
+      setSignInError(json.error ?? `mint failed (${res.status})`);
+      return;
+    }
+    sessionStorage.setItem(HST_KEY, json.token);
+    if (signInAdminToken) sessionStorage.setItem("hive_admin", signInAdminToken);
+    setSession({ principalId: json.principalId ?? signInPrincipal, tenant: json.tenant ?? tenant });
+    setAuthBanner(null);
+    setSignInOpen(false);
+    setSignInAdminToken("");
+  }, [tenant, signInPrincipal, signInAdminToken]);
+
+  const signOut = useCallback(async () => {
+    try {
+      await apiFetch("/api/session/revoke", { method: "POST" });
+    } catch { /* best effort */ }
+    sessionStorage.removeItem(HST_KEY);
+    sessionStorage.removeItem("hive_admin");
+    setSession(null);
+  }, []);
+
+  useEffect(() => {
+    // Resume an existing session from sessionStorage, if any.
+    if (!sessionStorage.getItem(HST_KEY)) return;
+    apiFetch("/api/session/me")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data?.ok) {
+          setSession({ principalId: data.principalId, tenant: data.tenant });
+          setAuthBanner(null);
+        } else {
+          sessionStorage.removeItem(HST_KEY);
+          setSession(null);
+        }
+      })
+      .catch(() => undefined);
+  }, []);
 
   const appendTerm = useCallback(
     (...items: { kind: "in" | "out" | "err" | "drill"; text: string }[]) => {
@@ -267,9 +334,10 @@ export default function LiveHivePage() {
 
   const fetchState = useCallback(async (t = tenant) => {
     const res = await apiFetch(`/api/state?tenant=${encodeURIComponent(t)}`);
+    if (note401(res)) return;
     const data = (await res.json()) as WorkspaceSnapshot;
     setSnap(data);
-  }, [tenant]);
+  }, [tenant, note401]);
 
   useEffect(() => {
     void fetchState(tenant);
@@ -296,6 +364,10 @@ export default function LiveHivePage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tenant, actor: who, line }),
       });
+      if (note401(res)) {
+        appendTerm({ kind: "err", text: "session required — sign in (top right)." });
+        return;
+      }
       const json = (await res.json()) as {
         ok: boolean;
         lines?: string[];
@@ -323,6 +395,7 @@ export default function LiveHivePage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tenant, drill, taskId }),
       });
+      if (note401(res)) return;
       const json = (await res.json()) as {
         ok: boolean;
         logs?: string[];
@@ -345,6 +418,7 @@ export default function LiveHivePage() {
     setTab("ops");
     try {
       const res = await apiFetch("/api/chaos-run", { method: "POST" });
+      if (note401(res)) return;
       const json = (await res.json()) as { ok: boolean; results: ChaosResult[] };
       setChaosResults(json.results);
       appendTerm({
@@ -359,12 +433,25 @@ export default function LiveHivePage() {
   async function resetDb() {
     setBusy(true);
     try {
-      const res = await apiFetch("/api/reset", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tenant }),
-      });
-      const json = (await res.json()) as { state: WorkspaceSnapshot };
+      // Reset requires the admin token (not the session) — use it when we have it.
+      const admin = sessionStorage.getItem("hive_admin");
+      const res = admin
+        ? await fetch(`${API_BASE}/api/reset`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${admin}` },
+            body: JSON.stringify({ tenant }),
+          })
+        : await apiFetch("/api/reset", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ tenant }),
+          });
+      if (note401(res)) return;
+      const json = (await res.json()) as { state?: WorkspaceSnapshot; error?: string };
+      if (!res.ok || !json.state) {
+        appendTerm({ kind: "err", text: json.error ?? `reset failed (${res.status})` });
+        return;
+      }
       setSnap(json.state);
       setChaosResults(null);
       appendTerm({ kind: "drill", text: "↺ SQLite kernel reset & re-seeded with fresh Ed25519 keys." });
@@ -381,6 +468,7 @@ export default function LiveHivePage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tenant, actor: "ana", agentId, op }),
       });
+      if (note401(res)) return;
       const json = (await res.json()) as { state?: WorkspaceSnapshot; error?: string };
       if (json.state) setSnap(json.state);
       appendTerm({
@@ -408,6 +496,7 @@ export default function LiveHivePage() {
           createTask,
         }),
       });
+      if (note401(res)) return;
       const json = (await res.json()) as {
         inbound?: { trust: string; flags: { instructionLike: boolean; matchedSpans: string[] } };
         state?: WorkspaceSnapshot;
@@ -433,16 +522,36 @@ export default function LiveHivePage() {
       const res = await apiFetch(
         `/api/search?tenant=${encodeURIComponent(tenant)}&q=${encodeURIComponent(searchQ)}`,
       );
+      if (note401(res)) return;
       const json = (await res.json()) as { results: EventRecord[] };
       setSearchResults(json.results);
     }, 180);
     return () => clearTimeout(id);
-  }, [searchQ, tenant]);
+  }, [searchQ, tenant, note401]);
 
   if (!snap) {
     return (
-      <Card className="p-10 text-center text-sm text-zinc-400">
-        Connecting to Hive Authority Kernel…
+      <Card className="mx-auto mt-16 max-w-md p-8 text-center">
+        <div className="mb-2 text-sm font-semibold text-zinc-200">Connecting to Hive Authority Kernel…</div>
+        {authBanner && <div className="mb-4 text-xs text-amber-300">{authBanner}</div>}
+        <div className="flex items-center justify-center gap-2">
+          <input
+            className="w-24 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-white"
+            placeholder="principal"
+            value={signInPrincipal}
+            onChange={(e) => setSignInPrincipal(e.target.value)}
+          />
+          <input
+            type="password"
+            className="w-44 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-white"
+            placeholder="HIVE_ADMIN_TOKEN"
+            value={signInAdminToken}
+            onChange={(e) => setSignInAdminToken(e.target.value)}
+          />
+          <Btn size="sm" onClick={() => void signIn()}>Sign in</Btn>
+        </div>
+        {signInError && <div className="mt-2 text-xs text-red-400">{signInError}</div>}
+        <div className="mt-4 text-[10px] text-zinc-500">Mints an hst_ session via /api/session/mint (admin-gated). Needed once per tab.</div>
       </Card>
     );
   }
@@ -503,9 +612,11 @@ export default function LiveHivePage() {
             <label className="flex items-center gap-1.5 text-zinc-400">
               Tenant (RLS)
               <select
-                value={tenant}
+                value={session ? session.tenant : tenant}
+                disabled={!!session}
                 onChange={(e) => setTenant(e.target.value)}
-                className="rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-white"
+                title={session ? "tenant is pinned by your hst_ session — sign out to switch" : undefined}
+                className="rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-white disabled:opacity-50"
               >
                 <option value="acme">acme (primary)</option>
                 <option value="globex">globex (isolated)</option>
@@ -515,9 +626,11 @@ export default function LiveHivePage() {
             <label className="flex items-center gap-1.5 text-zinc-400">
               Principal
               <select
-                value={actor}
+                value={session ? session.principalId : actor}
+                disabled={!!session}
                 onChange={(e) => setActor(e.target.value)}
-                className="rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-white"
+                title={session ? "identity is pinned by your hst_ session — sign out to switch" : undefined}
+                className="rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-white disabled:opacity-50"
               >
                 {snap.principals.map((p) => (
                   <option key={p.id} value={p.id}>
@@ -526,6 +639,45 @@ export default function LiveHivePage() {
                 ))}
               </select>
             </label>
+
+            {session ? (
+              <span className="inline-flex items-center gap-2 rounded-lg border border-emerald-800 bg-emerald-950/60 px-2 py-1 text-xs text-emerald-300">
+                <Lock size={10} /> hst_ {session.principalId}
+                <button className="ml-1 underline decoration-dotted hover:text-emerald-100" onClick={() => void signOut()}>
+                  sign out
+                </button>
+              </span>
+            ) : (
+              <span className="relative inline-flex items-center gap-1">
+                <button
+                  className="inline-flex items-center gap-1 rounded-lg border border-amber-800 bg-amber-950/60 px-2 py-1 text-xs text-amber-300 hover:text-amber-100"
+                  onClick={() => setSignInOpen((v) => !v)}
+                  title="Mint an hst_ session (admin-gated)"
+                >
+                  <Lock size={10} /> sign in
+                </button>
+                {signInOpen && (
+                  <span className="absolute right-0 top-8 z-20 flex w-72 flex-col gap-2 rounded-xl border border-zinc-700 bg-zinc-950 p-3 shadow-xl">
+                    <span className="text-[10px] uppercase tracking-wide text-zinc-500">Sign in (mints hst_ session)</span>
+                    <input
+                      className="rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-white"
+                      placeholder="principal id (e.g. ana)"
+                      value={signInPrincipal}
+                      onChange={(e) => setSignInPrincipal(e.target.value)}
+                    />
+                    <input
+                      type="password"
+                      className="rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-white"
+                      placeholder="HIVE_ADMIN_TOKEN (blank if dev-open)"
+                      value={signInAdminToken}
+                      onChange={(e) => setSignInAdminToken(e.target.value)}
+                    />
+                    {signInError && <span className="text-[10px] text-red-400">{signInError}</span>}
+                    <Btn size="sm" onClick={() => void signIn()}>Mint session</Btn>
+                  </span>
+                )}
+              </span>
+            )}
 
             <span className="inline-flex items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-zinc-300">
               <Clock size={12} /> {fmtTime(snap.now)}
@@ -542,6 +694,12 @@ export default function LiveHivePage() {
           </div>
         </div>
       </Card>
+
+      {authBanner && (
+        <div className="rounded-xl border border-amber-500/60 bg-amber-500/10 px-4 py-2 text-xs text-amber-200">
+          {authBanner}
+        </div>
+      )}
 
       {/* Live Gate / Breaker Banners */}
       {awaitingTasks.map((t) => (

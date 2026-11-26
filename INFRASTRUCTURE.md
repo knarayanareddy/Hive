@@ -13,8 +13,8 @@ Status of every item from the post-build review, what was done, what is
   wheel, unix socket) and exercised by `scripts/verify-postgres-rls.mjs`, which:
   recreates a throwaway database (`hive_rls_verify`, dropped afterwards), applies the
   migration twice (idempotent), grants least-privilege rights to a **non-superuser**
-  role `hive_rls_app`, seeds two tenants, and asserts **25/25 checks**:
-  ENABLE + FORCE RLS on all 12 tenant tables, default-deny (unset *and* empty
+  role `hive_rls_app`, seeds two tenants, and asserts **27/27 checks**:
+  ENABLE + FORCE RLS on all 14 tenant tables, default-deny (unset *and* empty
   `app.tenant_id`), cross-tenant SELECT/UPDATE/DELETE isolation, `WITH CHECK` insert
   denial, FTS5/GIN `tsvector` scoping, and read-only `authority_meta` bootstrap.
 - **Run it yourself:** `docker compose up -d postgres` then
@@ -46,7 +46,7 @@ into the **same** outbox path the 10 chaos specs exercise:
   `live` (fail fast at boot if GitHub or Slack unresolvable) · `simulation`
   (never touches network). A configured-live category **never silently falls back**
   — network failure marks the outbox row `failed` and it stays retryable.
-- **Verified by `tests/integrations.spec.ts`** (runs in `npm test`, 12/12 green):
+- **Verified by `tests/integrations.spec.ts`** (runs in `npm test`, 16/16 green):
   mock GitHub + mock Slack on 127.0.0.1 *as separate processes* (the kernel's
   effect path is synchronous curl — in-process mocks deadlock). Covers outbox-confirmed
   PR creation, idempotent replay (1 POST only), fresh-key read-back after a simulated
@@ -54,7 +54,7 @@ into the **same** outbox path the 10 chaos specs exercise:
   post/replay, ledger read-back, DLP failure marking (`sk_live_*` blocked, outbox row
   `failed`, zero side effect), and `HIVE_INTEGRATIONS` mode resolution.
 - **To go live, you must supply** (see `.env.example`): `HIVE_GITHUB_REPO=owner/name`
-  + `HIVE_GITHUB_TOKEN` (or run `gh auth login` — the server auto-reads `gh auth token`)
+  + `HIVE_GITHUB_TOKEN` (or set `HIVE_GITHUB_USE_GH_CLI=1` to opt into reading `gh auth token`)
   and/or `HIVE_SLACK_WEBHOOK_URL` (or bot token + channel). Then restart; boot log
   prints `[hive-integrations] …` with the resolved mode for each category, and the
   **Live Hive** page shows `github:live` / `slack:live` pills (top status bar).
@@ -62,9 +62,12 @@ into the **same** outbox path the 10 chaos specs exercise:
 - **Honest limitation:** the live path was verified against mocks + API-shape review,
   not against real GitHub/Slack — the sandbox allowlist blocks `api.slack.com`/`slack.com`,
   and no user-provided GitHub token/repo exists yet. The first real call is one env var away.
-- **Not done (by design):** no webhook receiver for inbound GitHub/Slack events yet
-  (the ingest pipeline accepts messages via `/api/ingest`, but nothing scrapes a
-  webhook URL). Requires a publicly reachable gateway — see §5.
+- **Inbound webhooks (2026-11-26):** `POST /api/webhooks/github` and `POST /api/webhooks/slack`
+  verify HMAC-SHA256 signatures (`X-Hub-Signature-256` / `v0=` scheme) with `timingSafeEqual`
+  **before parsing**, enforce a 300s replay window on Slack timestamps, dedup deliveries via the
+  `webhook_delivery` table, and ingest into `HIVE_WEBHOOK_TENANT` as quarantined external
+  messages (`HIVE_WEBHOOK_CHANNEL`). An unset webhook secret fails closed (503). Request bodies
+  are capped at 1 MiB (413). Nothing is registered on a public URL yet — that needs §5.
 
 ## 3. Browser-level QA — ⚠️ NOT PERFORMED IN-SANDBOX (no browser binary exists here)
 
@@ -89,8 +92,8 @@ into the **same** outbox path the 10 chaos specs exercise:
 
 ## 5. Push / deploy — ✅ BRANCH PUSHED · Vercel ready, deploy not triggered (needs your go-ahead)
 
-- Branch `arena/446b8aab-hive` is pushed to `origin` (commit at HEAD includes this
-  infra pass).
+- Branch `arena/446b8aab-hive` is pushed to `origin` (security remediation commits:
+  see `SECURITY_REMEDIATION_PLAN.md` execution log). PR #3 (remediation) opens on your go-ahead.
 - `vercel.json` ships: Vite framework preset, `npm ci` install, `npm run build`,
   `dist` output, SPA fallback rewrites. **The static frontend deploys cleanly as-is.**
   What it does *not* get you: a reachable `/api` — Vercel serverless would need a
@@ -106,28 +109,112 @@ into the **same** outbox path the 10 chaos specs exercise:
   URL registered in GitHub/Slack. This is the recommended next milestone — it is
   intentionally not auto-deployed.
 
-## 6. Production hardening — ✅ BASELINE SHIPPED · residual items listed honestly
+## 6. Production hardening — ✅ BASELINE + PHASE-0 REMEDIATION SHIPPED · residual items listed honestly
 
-Shipped and verified in this pass:
+Shipped and verified in this pass (2026-11-26):
+- **Per-principal sessions**: HTTP routes derive `(tenant, actor)` exclusively from
+  `hst_<base64url(32B)>` sessions (SHA-256-hashed at rest in `principal_session`,
+  12h default TTL, 24h cap, `timingSafeEqual` on hashes, `revoked` flag,
+  `last_used_at`). Minting requires `HIVE_ADMIN_TOKEN` (≥32 chars; mandatory in
+  production, else boot refuses). Body/query `actor` honored only under
+  `HIVE_DEV_INSECURE_ACTOR=1` (loud boot warning; refused in production).
+  `/api/state` no longer leaks `activeTokens`. `hct_` capability jar is keyed per
+  session (200-entry LRU), never global per tenant.
+- **Admin/drills gating**: `/api/reset` and `/api/scenario` return 403 unless
+  `HIVE_ENABLE_DEV_DRILLS=1`; `/api/reset` additionally requires the admin token
+  (fs.rmSync of the DB is no longer reachable unauthenticated).
+- **Custodial keys**: `HIVE_MASTER_KEY` (AES-256-GCM) envelope-encrypts
+  `principal.privkey` and `authority_meta.gateway_priv` at rest; legacy plaintext
+  re-encrypts in place at boot; `HIVE_GATEWAY_SIGNING_KEY` overrides the DB copy for
+  signing; required in production.
+- **Commit-then-send outbox**: effects stage as `pending` inside the kernel
+  transaction; DLP/read-after-write/perform run post-commit (`drainOutboxEffect`);
+  a crashed drain is re-driven by `kernel.reconcileOutbox()` at server boot;
+  confirmed merges close tasks stuck pre-`merged→closed`. Effect ledger is
+  tenant-scoped.
+- **Human authz hardening**: role-gated `task.verify` (owner|lead|security|verifier),
+  `two_of_three` security gates require owner|lead|security, approver must hold
+  channel `post` access, rejects invalidate outstanding approvals for the SHA,
+  attestation revoke/restore restricted to the owning human or an `owner`,
+  minted `hct_` ops are the intersection with Owner Attestation scope, agents are
+  fenced out of tokenless `pushPatch`/`runEffect`/`postChannelMessage`.
+- **Inbound webhook HMAC** (see §2) + 1 MiB body cap (413) + foreign-`Host` → 421
+  (`HIVE_ALLOWED_HOSTS`, `GET /api/health` exempt) + CORS restricted to loopback
+  origins (or `HIVE_ALLOWED_ORIGINS`), `Authorization` in Allow-Headers.
+
+Shipped in Phase 1 (2026-11-27, PR #3):
+- **Incremental `verifyLog` verification cache** — result cached per
+  `(tenant, selector, resolved checkpoint, mutationEpoch, incarnation, PRAGMA data_version)`;
+  same-process mutations bump `mutationEpoch`, out-of-process writes (e.g. drill scripts on
+  the same SQLite file) are caught by `data_version`; incarnation rotation (PITR/reset) also
+  invalidates. Ed25519 `KeyObject`s and verdicts are memoized (cache keys include the
+  signature, so a swapped signature never hits a cached verdict). Cache-invalidation drill:
+  kernel-level spec `tests/kernel.verifylog_cache.spec.ts` (out-of-process tamper via a second
+  connection + in-kernel tamper) and an opt-in `smoke-load.mjs` reset drill (both pass).
+- **Domain-separated Merkle tree** — leaves `H(0x00 ‖ id)`, nodes `H(0x01 ‖ left ‖ right)`;
+  leaf/node domains cannot collide (checkpoint verification hardened).
+- **Event content hash v1** — `computeEventId` now hashes
+  `sha256(canonicalJson({domain:"hive.event.v1", …including attest}))` instead of a
+  pipe-joined preimage whose field-boundary ambiguity allowed preimage collisions across
+  e.g. `actor="a|b", channel="c"` vs `actor="a", channel="b|c"`. **Breaking change**: event
+  ids computed by earlier builds do not match; databases seeded before this change fail
+  `verifyLog` and must be re-seeded/restored (no migration — pre-production; the demo DB
+  was re-seeded). `attest` is now bound into the event id.
+- **Checkpoint lower-bound + head binding** — `verifyLog` rejects a checkpoint claiming
+  `uptoSeq` beyond the log end (tail-truncation suspected) and rejects a `headEventId`
+  that doesn't match the event at `seq = uptoSeq`.
+- **Per-identity token buckets** (in-memory ADR-0033 style) — 6000 req/min per identity
+  (bearer/session-token hash, else client IP; `X-Forwarded-For` honored), 60 effect
+  calls/min (CLI `effect run` lines, `/api/scenario`, `/api/chaos-run`); 429 +
+  `Retry-After` + `retryAfterSeconds`; `/api/health` exempt; resets on restart.
+- **Wall-clock default** — `HIVE_CLOCK_MODE=wall` (default) keeps real time flowing;
+  leases/attestations expire wall-clock. `HIVE_CLOCK_MODE=sim` freezes time at the seeded
+  `sim_now_ms` baseline (tests only; specs pin it via `tests/_setup.ts`). In wall mode
+  `hive tick --advance` applies a process-local virtual offset (demo fast-forward; resets on
+  restart, failing safe by making leases expire sooner).
+- **`/api/state` ETag/304** — strong revalidation on workspace content (volatile `now`
+  excluded from the hash); `If-None-Match` → 304 with `Cache-Control: no-cache`.
+- **Dead `hrv_` revision tokens removed** (`issueRevisionToken`/`checkRevisionToken`/
+  `RevisionToken`); PITR spec rewired to capability tokens (`IncarnationMismatchError`
+  coverage unchanged). DLP is centralized in `policy.ts` (`enforceOutboundDlp` post-commit
+  pre-send; failures mark the outbox row `failed`) and verified by specs
+  (`ingest.injection.spec`, `integrations.spec`). Log-verification cost on `/api/state`
+  is cached (see above).
+
+Shipped previously (baseline):
 - **Gateway auth**: `HIVE_GATEWAY_TOKEN` — when set, all `/api/*` except
   `GET /api/health` require `Authorization: Bearer <token>` (verified live:
-  401 without/with wrong token, 200 with, health stays open). UI sends the token
-  when `VITE_HIVE_API_TOKEN` is set; 401s surface as empty/error UI states.
+  401 without/with wrong token, 200 with, health stays open). The UI now also
+  renders an explicit sign-in panel and a 401 banner (2026-11-26); full
+  401/error-surface design is Phase 3 (H6).
 - **Backup/PITR drill**: `npm run drill:backup` — seed → claim → snapshot → mutate →
   restore against real DB files; asserts incarnation rotation, pre-restore token
   rejection, `FTS5` survival, hash-chain verification. **All 6 checks pass.**
-- **Load canary**: `npm run smoke:load` — 512 requests at concurrency 32:
-  `/api/health` p50 ≈ 8ms; `/api/state` p50 ≈ 86ms, p95 ≈ 168ms (it re-verifies the
-  full signed log + checkpoint per call by design — cache this before internet-scale).
-- **Secrets**: `.env.example` documents every variable; `.gitignore` covers `.env*`;
-  no tokens are read from the repo. `integrationStatus()` never emits secret values.
-- **CI**: `.github/workflows/ci.yml` — `npm ci → build → test` (12 specs) +
+- **Load canary**: `npm run smoke:load` — mints an `hst_` admin session, then hits
+  `/api/health` and `/api/state`; includes an ETag/304 drill and an opt-in
+  verifyLog-cache invalidation drill (`HIVE_SMOKE_ALLOW_RESET=1`, destructive: wipes and
+  re-seeds the demo DB). 2026-11-27 measurement (128 requests @ concurrency 16,
+  fresh server, warm verify cache): `/api/state` p50 ≈ 16ms, p95 ≈ 28–35ms — the
+  ~168ms full re-verify is gone from the hot path, but the plan's `<25ms p95`
+  target is not met under 16-way load yet (snapshot serialization dominates once
+  verify is cached).
+- **Secrets**: `.env.example` is committed (`.gitignore` allows it via `!.env.example`) and
+  documents every variable; no tokens are read from the repo; `.hive/` (live DB, WAL, ledger)
+  and `*.db*` are git-ignored; `integrationStatus()` never emits secret values.
+  (Two earlier drafts of this section claimed these without the `!.env.example` exception
+  being present — corrected 2026-11-26.)
+- **CI**: `.github/workflows/ci.yml` — `npm ci → build → test` (17 specs) +
   Postgres 16 RLS verification job.
 
 Residual, not done (needs real infrastructure / decisions from you):
-- No TLS termination, rate limiting, or WAF on the gateway (front it with a proxy or
-  platform that provides them; do not expose `:8787` raw to the internet).
-- No secrets manager integration (Vault/SM/Doppler); env vars only.
+- No TLS termination or WAF on the gateway (front it with a proxy or platform that
+  provides them; do not expose `:8787` raw to the internet).
+- Rate buckets are in-memory: limits reset on restart and are per-process (single-machine
+  deployment; revisit with the PG runtime / multi-instance §1).
+- verifyLog cache correctness rests on `mutationEpoch` + `PRAGMA data_version` + incarnation;
+  it is not a substitute for treating the SQLite file as trusted single-process state.
+- Event-id format v1 is a one-way door: old databases fail `verifyLog` (see above).
+- No secrets manager integration (Vault/SM/Doppler); env vars + KMS-backed key custody options.
 - No queue worker for exactly-once external effects (Slack gap, see §2).
 - No `pg`-backed runtime store (see §1); SQLite is single-process.
 - No alerting/metrics (`call_telemetry` table is populated; nothing exports it yet).

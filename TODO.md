@@ -32,7 +32,8 @@ egress allowlist, and no user-provided GitHub repo/token exists here.
    history you care about — e.g. a scratch org repo).
 2. Create a fine-grained PAT scoped to that repo: `Contents: write`,
    `Pull requests: write`, `Issues: write`. Or run `gh auth login` — the server
-   auto-reads `gh auth token` (disable with `HIVE_GITHUB_USE_GH_CLI=0`).
+   reads `HIVE_GITHUB_TOKEN` from the env; set `HIVE_GITHUB_USE_GH_CLI=1` to opt into the
+   `gh auth token` fallback (off by default).
 3. For Slack: create an *incoming webhook* bound to the target channel
    (simplest, no scopes to review) or a bot token with `chat:write`.
 4. Set and restart (see `.env.example`):
@@ -59,7 +60,7 @@ egress allowlist, and no user-provided GitHub repo/token exists here.
 single-writer, local disk. The design's Principle 8 ("same semantics local and
 cloud") wants Postgres 16 + FORCE RLS as the production store, not just as a
 verified schema. The migration and its verifier (`npm run verify:postgres`,
-25/25 checks) are the acceptance gate that already exists.
+27/27 checks) are the acceptance gate that already exists.
 
 **Blocked by:** engineering decision (connection strategy for serverless vs
 long-lived gateway) and a managed Postgres instance.
@@ -76,7 +77,7 @@ long-lived gateway) and a managed Postgres instance.
      RETURNING incarnation`;
    - FTS: `fts_doc @@ to_tsquery('english', …)` + GIN index instead of FTS5;
    - PITR: WAL archiving / basebackup export in place of `VACUUM INTO` snapshots
-     (document restore procedure; verify rotation kills stale `hct_`/`hrv_` tokens);
+     (document restore procedure; verify rotation kills stale `hct_` capability tokens);
    - transactions: keep the same savepoint semantics used by `store.tx()`.
 3. Keep `node:sqlite` as the default for local dev/tests; select backend via
    env (`HIVE_STORE=sqlite|postgres`, `HIVE_PG_URL=…`) — do NOT delete the
@@ -88,8 +89,8 @@ long-lived gateway) and a managed Postgres instance.
    store-agnostic).
 
 **Acceptance criteria:**
-- [ ] All 12 specs pass with `HIVE_STORE=postgres`.
-- [ ] `npm run verify:postgres` still 25/25 (unchanged schema semantics).
+- [ ] All 17 specs pass with `HIVE_STORE=postgres`.
+- [ ] `npm run verify:postgres` still 27/27 (unchanged schema semantics).
 - [ ] A pre-restore token is rejected after a PITR restore on pg (mirror of
       `authority.pitr.spec.ts`).
 - [ ] One chaos drill (`gate.sha`) executed against the pg backend with logs.
@@ -154,10 +155,11 @@ your go-ahead (this repo deliberately did not auto-deploy).
 3. `vercel` connector usage (needs explicit go-ahead): `create_project` →
    `create_env_var` × 2 → `create_deployment` with `git_source` ref
    `arena/446b8aab-hive` (or `main` once merged).
-4. Wire inbound webhooks LAST (only once the gateway is public): register the
-   GitHub webhook (repo → gateway `/api/ingest` w/ signature verification —
-   **add HMAC verification before enabling**, it does not exist yet) and Slack
-   events similarly. Outbound effects (item #1) don't need webhooks.
+4. Wire inbound webhooks LAST (only once the gateway is public): set
+   `HIVE_GITHUB_WEBHOOK_SECRET` / `HIVE_SLACK_SIGNING_SECRET` on the gateway and point
+   the repo/workspace webhook at `/api/webhooks/github` / `/api/webhooks/slack`
+   (HMAC verification + replay window + delivery dedup implemented 2026-11-26).
+   Outbound effects (item #1) don't need webhooks.
 5. Verify: open the deployed URL → pills show `live`; state loads; a drill runs;
    CORS: gateway must allow the Vercel origin (or same-origin proxy).
 
@@ -174,6 +176,6 @@ your go-ahead (this repo deliberately did not auto-deploy).
 ## Explicitly out of scope until these land
 
 TLS/WAF in front of the gateway, secrets-manager integration, alerting export of
-`call_telemetry`, queue worker for exactly-once Slack delivery, GitHub webhook
-inbound ingestion with HMAC verification (required before §4 step 4), Postgres
-runtime store (item #2 owns this).
+`call_telemetry`, queue worker for exactly-once Slack delivery, Postgres runtime
+store (item #2 owns this). (GitHub/Slack webhook receivers WITH HMAC verification
+landed 2026-11-26 — HIVE_GITHUB_WEBHOOK_SECRET / HIVE_SLACK_SIGNING_SECRET.)

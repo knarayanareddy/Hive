@@ -61,6 +61,17 @@ export function explainGrant(
  * - Agents MUST carry a valid non-revoked, non-expired attestation signed by a DIFFERENT human owner,
  *   whose scope covers `requiredOp`.
  */
+/**
+ * Human role requirements for privileged ops. Humans are roots of authority for
+ * most actions, but a subset of high-trust ops is role-gated so a low-privilege
+ * member cannot fabricate verifier receipts or override protected gates.
+ * Agents are governed by their Owner Attestation scope instead (see below).
+ */
+const HUMAN_SCOPED_OPS: ReadonlyArray<{ op: string; roles: readonly string[] }> = [
+  { op: "task.verify", roles: ["owner", "lead", "security", "verifier"] },
+  { op: "agent.attestation.manage", roles: ["owner"] },
+];
+
 export function verifyPrincipalAuthority(
   principal: Principal,
   ownerPrincipal: Principal | undefined,
@@ -68,6 +79,12 @@ export function verifyPrincipalAuthority(
   nowMs: number,
 ): { attestChain: string[] } {
   if (principal.kind === "human") {
+    const need = HUMAN_SCOPED_OPS.find(({ op }) => matchScopePattern(op, requiredOp));
+    if (need && !need.roles.includes(principal.role)) {
+      throw new ForbiddenError(
+        `human ${principal.id} (role=${principal.role}) may not perform "${requiredOp}" (requires role: ${need.roles.join(", ")})`,
+      );
+    }
     return { attestChain: [`human:${principal.id} (role=${principal.role})`] };
   }
   const att = principal.attestation;
@@ -135,8 +152,14 @@ export function assertCapabilityAllows(claims: CapabilityClaims, requiredOp: str
 
 const SECRET_PATTERNS: { name: string; re: RegExp }[] = [
   { name: "stripe_live_key", re: /\bsk_live_[A-Za-z0-9_]{6,}/ },
-  { name: "aws_access_key", re: /\bAKIA[0-9A-Z]{16}\b/ },
-  { name: "github_pat", re: /\bgh[pousr]_[A-Za-z0-9_]{12,}/ },
+  { name: "stripe_restricted_key", re: /\brk_live_[A-Za-z0-9_]{6,}/ },
+  { name: "aws_access_key", re: /\b(AKIA|ASIA)[0-9A-Z]{16}\b/ },
+  { name: "github_pat_classic", re: /\bgh[pousr]_[A-Za-z0-9_]{12,}/ },
+  { name: "github_pat_fine_grained", re: /\bgithub_pat_[A-Za-z0-9_]{20,}/ },
+  { name: "slack_token", re: /\bxox[baprs]-[A-Za-z0-9-]{10,}/ },
+  { name: "anthropic_key", re: /\bsk-ant-[A-Za-z0-9_-]{10,}/ },
+  { name: "openai_project_key", re: /\bsk-proj-[A-Za-z0-9_-]{10,}/ },
+  { name: "hive_capability_token", re: /\bhct_[A-Za-z0-9_-]{10,}[.][A-Za-z0-9_-]{10,}/ },
   { name: "pem_private_key", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
   { name: "deploy_key_leak", re: /\bDEPLOY_KEY\s*=\s*\S+/i },
 ];
@@ -147,6 +170,19 @@ export function scanSecretSpans(text: string): string[] {
     if (p.re.test(text)) hits.push(p.name);
   }
   return hits;
+}
+
+/**
+ * Replace every secret-pattern span in `text` with `[REDACTED:<pattern_name>]`.
+ * Used by ingest to avoid persisting key-shaped material into the event log.
+ */
+export function redactSecretSpans(text: string): string {
+  let out = text;
+  for (const p of SECRET_PATTERNS) {
+    const flags = p.re.flags.includes("i") ? "gi" : "g";
+    out = out.replace(new RegExp(p.re.source, flags), `[REDACTED:${p.name}]`);
+  }
+  return out;
 }
 
 /**
