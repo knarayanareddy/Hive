@@ -255,4 +255,41 @@ checklist inside the repo (Phase 4) — do not revive the zips.
   (strict `app.tenant_id <> ''` predicate) + `verify-postgres-rls.mjs` covers both
   (27/27). Full `schema_def`/`channel_room`/`sim_now_ms` PG alignment (M1) remains
   Phase 0.5/1 as planned.
-- **Not pushed / PR #3 not opened** — awaiting explicit user go-ahead (deploy posture).
+- **Pushed + PR #3 opened 2026-11-26** (https://github.com/knarayanareddy/Hive/pull/3) on explicit user go-ahead. Phase 0 closed.
+
+### Execution log — Phase 1 (2026-11-27, this branch / PR #3)
+
+- **verifyLog hot path (M2)** — incremental cache keyed on
+  `(tenant, selector, resolved checkpoint id, mutationEpoch, incarnation, PRAGMA data_version)`;
+  same-process mutations bump `mutationEpoch`; out-of-process writes caught by `data_version`
+  (proven by `tests/kernel.verifylog_cache.spec.ts`, which tampers via a *second* connection);
+  KeyObject + verdict memoization in `crypto.ts`; checkpoint lower-bound (`chk.uptoSeq > log end` →
+  reject) + `headEventId` binding (M3); domain-separated Merkle (`0x00` leaf / `0x01` node).
+  Measured: `/api/state` p50 ≈ 16ms, p95 ≈ 28–35ms under 16-way concurrency (was p50 ≈ 86ms,
+  p95 ≈ 168ms). Plan target `<25ms p95` NOT yet met under load — residual item (snapshot
+  serialization now dominates; consider pre-computed snapshot cache in Phase 2+).
+- **Event content hash v1 (M3)** — `sha256(canonicalJson({domain:"hive.event.v1", …, attest}))`;
+  pipe-join preimage ambiguity eliminated; `attest` chain now bound into the id. **Breaking
+  change**: pre-Phase-1 databases fail `verifyLog` — re-seed/restore required (demo DB re-seeded
+  2026-11-27). No migration: pre-production.
+- **Per-identity token buckets (H7)** — 6000 req/min; 60 effect calls/min
+  (CLI `effect run…`, `/api/scenario`, `/api/chaos-run`); 429 + `Retry-After` +
+  `retryAfterSeconds`; loopback/Host/CORS unchanged; `/api/health` exempt; in-memory
+  (resets on restart; single-process ADR-0033 stance).
+- **Wall clock (M5)** — `HIVE_CLOCK_MODE=wall` default; `sim` frozen clock only under
+  `tests/_setup.ts` (specs pin it). `hive tick --advance` keeps working in wall mode via a
+  process-local virtual offset (resets on restart; fails safe — leases expire sooner).
+- **`/api/state` ETag/304** — baseline hash excludes volatile `now`; `If-None-Match` → 304.
+  `activeTokens` was already absent.
+- **Dead `hrv_` revision tokens removed** — `issueRevisionToken`/`checkRevisionToken`/
+  `RevisionToken` deleted; PITR spec rewired to capability-token incarnation rejection.
+- **M6 loop breaker** — confirmed already landed in Phase 0 (`MAX_ATTEMPTS=5` halt, attempt
+  counter survives re-claim/re-epoch). DLP centralization verified: outbox drain →
+  `enforceOutboundDlp` pre-send, failures mark row `failed` (specs: `integrations.spec.ts`,
+  `ingest.injection.spec.ts`).
+- **New spec count: 17/17 green.** PG RLS 27/27 · `drill:backup` ALL PASS · build green ·
+  live chaos-run 10/10 (post-v1-hash) · demo DB re-seeded clean.
+- **Verification cache drill** — kernel spec + opt-in `smoke-load.mjs` `HIVE_SMOKE_ALLOW_RESET=1`
+  reset drill (passes: incarnation changes, post-reset snapshot verifies).
+- **Executor note:** Phase 1 touches the SQLite open path on every request (`PRAGMA data_version`);
+  if the PG runtime lands (Phase 3), replace with `pg_snapshot`/xmin-based invalidation.

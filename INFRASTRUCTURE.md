@@ -142,6 +142,45 @@ Shipped and verified in this pass (2026-11-26):
   (`HIVE_ALLOWED_HOSTS`, `GET /api/health` exempt) + CORS restricted to loopback
   origins (or `HIVE_ALLOWED_ORIGINS`), `Authorization` in Allow-Headers.
 
+Shipped in Phase 1 (2026-11-27, PR #3):
+- **Incremental `verifyLog` verification cache** — result cached per
+  `(tenant, selector, resolved checkpoint, mutationEpoch, incarnation, PRAGMA data_version)`;
+  same-process mutations bump `mutationEpoch`, out-of-process writes (e.g. drill scripts on
+  the same SQLite file) are caught by `data_version`; incarnation rotation (PITR/reset) also
+  invalidates. Ed25519 `KeyObject`s and verdicts are memoized (cache keys include the
+  signature, so a swapped signature never hits a cached verdict). Cache-invalidation drill:
+  kernel-level spec `tests/kernel.verifylog_cache.spec.ts` (out-of-process tamper via a second
+  connection + in-kernel tamper) and an opt-in `smoke-load.mjs` reset drill (both pass).
+- **Domain-separated Merkle tree** — leaves `H(0x00 ‖ id)`, nodes `H(0x01 ‖ left ‖ right)`;
+  leaf/node domains cannot collide (checkpoint verification hardened).
+- **Event content hash v1** — `computeEventId` now hashes
+  `sha256(canonicalJson({domain:"hive.event.v1", …including attest}))` instead of a
+  pipe-joined preimage whose field-boundary ambiguity allowed preimage collisions across
+  e.g. `actor="a|b", channel="c"` vs `actor="a", channel="b|c"`. **Breaking change**: event
+  ids computed by earlier builds do not match; databases seeded before this change fail
+  `verifyLog` and must be re-seeded/restored (no migration — pre-production; the demo DB
+  was re-seeded). `attest` is now bound into the event id.
+- **Checkpoint lower-bound + head binding** — `verifyLog` rejects a checkpoint claiming
+  `uptoSeq` beyond the log end (tail-truncation suspected) and rejects a `headEventId`
+  that doesn't match the event at `seq = uptoSeq`.
+- **Per-identity token buckets** (in-memory ADR-0033 style) — 6000 req/min per identity
+  (bearer/session-token hash, else client IP; `X-Forwarded-For` honored), 60 effect
+  calls/min (CLI `effect run` lines, `/api/scenario`, `/api/chaos-run`); 429 +
+  `Retry-After` + `retryAfterSeconds`; `/api/health` exempt; resets on restart.
+- **Wall-clock default** — `HIVE_CLOCK_MODE=wall` (default) keeps real time flowing;
+  leases/attestations expire wall-clock. `HIVE_CLOCK_MODE=sim` freezes time at the seeded
+  `sim_now_ms` baseline (tests only; specs pin it via `tests/_setup.ts`). In wall mode
+  `hive tick --advance` applies a process-local virtual offset (demo fast-forward; resets on
+  restart, failing safe by making leases expire sooner).
+- **`/api/state` ETag/304** — strong revalidation on workspace content (volatile `now`
+  excluded from the hash); `If-None-Match` → 304 with `Cache-Control: no-cache`.
+- **Dead `hrv_` revision tokens removed** (`issueRevisionToken`/`checkRevisionToken`/
+  `RevisionToken`); PITR spec rewired to capability tokens (`IncarnationMismatchError`
+  coverage unchanged). DLP is centralized in `policy.ts` (`enforceOutboundDlp` post-commit
+  pre-send; failures mark the outbox row `failed`) and verified by specs
+  (`ingest.injection.spec`, `integrations.spec`). Log-verification cost on `/api/state`
+  is cached (see above).
+
 Shipped previously (baseline):
 - **Gateway auth**: `HIVE_GATEWAY_TOKEN` — when set, all `/api/*` except
   `GET /api/health` require `Authorization: Bearer <token>` (verified live:
@@ -151,25 +190,32 @@ Shipped previously (baseline):
 - **Backup/PITR drill**: `npm run drill:backup` — seed → claim → snapshot → mutate →
   restore against real DB files; asserts incarnation rotation, pre-restore token
   rejection, `FTS5` survival, hash-chain verification. **All 6 checks pass.**
-- **Load canary**: `npm run smoke:load` — 512 requests at concurrency 32:
-  `/api/health` p50 ≈ 8ms; `/api/state` p50 ≈ 86ms, p95 ≈ 168ms (it re-verifies the
-  full signed log + checkpoint per call by design — cache this before internet-scale).
+- **Load canary**: `npm run smoke:load` — mints an `hst_` admin session, then hits
+  `/api/health` and `/api/state`; includes an ETag/304 drill and an opt-in
+  verifyLog-cache invalidation drill (`HIVE_SMOKE_ALLOW_RESET=1`, destructive: wipes and
+  re-seeds the demo DB). 2026-11-27 measurement (128 requests @ concurrency 16,
+  fresh server, warm verify cache): `/api/state` p50 ≈ 16ms, p95 ≈ 28–35ms — the
+  ~168ms full re-verify is gone from the hot path, but the plan's `<25ms p95`
+  target is not met under 16-way load yet (snapshot serialization dominates once
+  verify is cached).
 - **Secrets**: `.env.example` is committed (`.gitignore` allows it via `!.env.example`) and
   documents every variable; no tokens are read from the repo; `.hive/` (live DB, WAL, ledger)
   and `*.db*` are git-ignored; `integrationStatus()` never emits secret values.
   (Two earlier drafts of this section claimed these without the `!.env.example` exception
   being present — corrected 2026-11-26.)
-- **CI**: `.github/workflows/ci.yml` — `npm ci → build → test` (12 specs) +
+- **CI**: `.github/workflows/ci.yml` — `npm ci → build → test` (17 specs) +
   Postgres 16 RLS verification job.
 
 Residual, not done (needs real infrastructure / decisions from you):
 - No TLS termination or WAF on the gateway (front it with a proxy or platform that
   provides them; do not expose `:8787` raw to the internet).
-- No per-identity rate limiting yet (Phase 1, H7/M: token buckets 6000 req/min).
+- Rate buckets are in-memory: limits reset on restart and are per-process (single-machine
+  deployment; revisit with the PG runtime / multi-instance §1).
+- verifyLog cache correctness rests on `mutationEpoch` + `PRAGMA data_version` + incarnation;
+  it is not a substitute for treating the SQLite file as trusted single-process state.
+- Event-id format v1 is a one-way door: old databases fail `verifyLog` (see above).
 - No secrets manager integration (Vault/SM/Doppler); env vars + KMS-backed key custody options.
 - No queue worker for exactly-once external effects (Slack gap, see §2).
 - No `pg`-backed runtime store (see §1); SQLite is single-process.
-- `/api/state` re-verifies the full signed log per call (p95 ≈ 168ms) — incremental
-  verification cache is Phase 1 (M2).
 - No alerting/metrics (`call_telemetry` table is populated; nothing exports it yet).
 - Backup cadence/retention is your job (`VACUUM INTO` snapshots are on-demand only).

@@ -77,7 +77,7 @@ long-lived gateway) and a managed Postgres instance.
      RETURNING incarnation`;
    - FTS: `fts_doc @@ to_tsquery('english', …)` + GIN index instead of FTS5;
    - PITR: WAL archiving / basebackup export in place of `VACUUM INTO` snapshots
-     (document restore procedure; verify rotation kills stale `hct_`/`hrv_` tokens);
+     (document restore procedure; verify rotation kills stale `hct_` capability tokens);
    - transactions: keep the same savepoint semantics used by `store.tx()`.
 3. Keep `node:sqlite` as the default for local dev/tests; select backend via
    env (`HIVE_STORE=sqlite|postgres`, `HIVE_PG_URL=…`) — do NOT delete the
@@ -89,7 +89,7 @@ long-lived gateway) and a managed Postgres instance.
    store-agnostic).
 
 **Acceptance criteria:**
-- [ ] All 16 specs pass with `HIVE_STORE=postgres`.
+- [ ] All 17 specs pass with `HIVE_STORE=postgres`.
 - [ ] `npm run verify:postgres` still 27/27 (unchanged schema semantics).
 - [ ] A pre-restore token is rejected after a PITR restore on pg (mirror of
       `authority.pitr.spec.ts`).

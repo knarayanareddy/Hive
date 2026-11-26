@@ -174,6 +174,78 @@ function sendJson(req: http.IncomingMessage, res: http.ServerResponse, status: n
   res.end(body);
 }
 
+// ── Per-identity token buckets (in-memory; resets on restart) ───────────────
+const RATE_WINDOW_MS = 60_000;
+const RATE_REQ_LIMIT = 6_000;   // requests / minute / identity
+const RATE_FX_LIMIT = 60;       // effect-firing calls / minute / identity
+
+interface RateBucket {
+  reqTokens: number;
+  reqResetAt: number;
+  fxTokens: number;
+  fxResetAt: number;
+}
+const rateBuckets = new Map<string, RateBucket>();
+
+function rateBucketFor(key: string, now: number): RateBucket {
+  if (rateBuckets.size > 5_000) {
+    for (const [k, v] of rateBuckets) {
+      if (v.reqResetAt <= now && v.fxResetAt <= now) rateBuckets.delete(k);
+    }
+  }
+  let b = rateBuckets.get(key);
+  if (!b) {
+    b = { reqTokens: RATE_REQ_LIMIT, reqResetAt: now + RATE_WINDOW_MS, fxTokens: RATE_FX_LIMIT, fxResetAt: now + RATE_WINDOW_MS };
+    rateBuckets.set(key, b);
+  }
+  if (b.reqResetAt <= now) {
+    b.reqTokens = RATE_REQ_LIMIT;
+    b.reqResetAt = now + RATE_WINDOW_MS;
+  }
+  if (b.fxResetAt <= now) {
+    b.fxTokens = RATE_FX_LIMIT;
+    b.fxResetAt = now + RATE_WINDOW_MS;
+  }
+  return b;
+}
+
+/** Identity for rate limiting: hst_/bearer hash when present, else client IP. */
+function rateKey(req: http.IncomingMessage): string {
+  const token = bearer(req);
+  if (token) return `tok:${crypto.createHash("sha256").update(token).digest("hex").slice(0, 24)}`;
+  const fwd = (req.headers["x-forwarded-for"] as string | undefined)?.split(",")[0]?.trim();
+  const ip = fwd || req.socket.remoteAddress || "unknown";
+  return `ip:${ip}`;
+}
+
+/** Consume one request token. Returns null if allowed, else retryAfterSeconds. */
+function rateLimitRequest(req: http.IncomingMessage): number | null {
+  const now = Date.now();
+  const b = rateBucketFor(rateKey(req), now);
+  if (b.reqTokens <= 0) return Math.ceil((b.reqResetAt - now) / 1000);
+  b.reqTokens -= 1;
+  return null;
+}
+
+/** Consume one effect token. Returns null if allowed, else retryAfterSeconds. */
+function rateLimitEffect(req: http.IncomingMessage): number | null {
+  const now = Date.now();
+  const b = rateBucketFor(rateKey(req), now);
+  if (b.fxTokens <= 0) return Math.ceil((b.fxResetAt - now) / 1000);
+  b.fxTokens -= 1;
+  return null;
+}
+
+/** True when this request causes external effects (drills or CLI effect commands). */
+function requestFiresEffect(pathname: string, body: unknown): boolean {
+  if (pathname === "/api/scenario") return true;
+  if (pathname === "/api/cli" && body && typeof body === "object") {
+    const line = String((body as Record<string, unknown>).line ?? "");
+    return /\beffect(s)?\b/i.test(line);
+  }
+  return false;
+}
+
 function bearer(req: http.IncomingMessage): string | null {
   const m = /^Bearer\s+(\S+)\s*$/i.exec(req.headers.authorization ?? "");
   return m ? m[1] : null;
@@ -434,6 +506,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Per-identity rate limit (health stays exempt for probes).
+  if (!(req.method === "GET" && req.url === "/api/health")) {
+    const retry = rateLimitRequest(req);
+    if (retry !== null) {
+      res.writeHead(429, {
+        ...corsHeaders(req),
+        "Content-Type": "application/json; charset=utf-8",
+        "Retry-After": String(retry),
+      });
+      res.end(JSON.stringify({ ok: false, error: "rate limit exceeded", retryAfterSeconds: retry }));
+      return;
+    }
+  }
+
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const pathname = url.pathname;
 
@@ -566,11 +652,23 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const snap = kernel.snapshotWorkspace(ctx.tenant);
-      sendJson(req, res, 200, {
-        ...snap,
-        actor: ctx.actor,
-        via: ctx.via,
+      const body = JSON.stringify({ ...snap, actor: ctx.actor, via: ctx.via });
+      // ETag covers workspace content only — `now` changes every second and would
+      // defeat revalidation. Excluding it: 304 means "workspace unchanged", not "time stood still".
+      const etagBasis = JSON.stringify({ ...snap, now: null, actor: ctx.actor, via: ctx.via });
+      const etag = `W/"${crypto.createHash("sha256").update(etagBasis).digest("hex").slice(0, 32)}"`;
+      if ((req.headers["if-none-match"] as string | undefined) === etag) {
+        res.writeHead(304, { ...corsHeaders(req), ETag: etag, "Cache-Control": "no-cache" });
+        res.end();
+        return;
+      }
+      res.writeHead(200, {
+        ...corsHeaders(req),
+        "Content-Type": "application/json; charset=utf-8",
+        ETag: etag,
+        "Cache-Control": "no-cache",
       });
+      res.end(body);
       return;
     }
 
@@ -600,6 +698,13 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const line = String(body.line ?? "");
+      if (requestFiresEffect(pathname, body)) {
+        const retryFx = rateLimitEffect(req);
+        if (retryFx !== null) {
+          sendJson(req, res, 429, { ok: false, error: "effect rate limit exceeded (60/min per identity)", retryAfterSeconds: retryFx });
+          return;
+        }
+      }
       const jar = jarFor(ctx.jarKey);
       const out = executeHiveCli(
         kernel,
@@ -679,6 +784,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/chaos-run") {
+      const retryFx = rateLimitEffect(req);
+      if (retryFx !== null) {
+        sendJson(req, res, 429, { ok: false, error: "effect rate limit exceeded (60/min per identity)", retryAfterSeconds: retryFx });
+        return;
+      }
       const results = runLiveChaosSuite();
       sendJson(req, res, 200, {
         ok: results.every((r) => r.ok),
@@ -690,6 +800,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathname === "/api/scenario") {
       if (!DEV_DRILLS) {
         sendJson(req, res, 403, { ok: false, error: "dev drills are disabled (set HIVE_ENABLE_DEV_DRILLS=1 to enable)" });
+        return;
+      }
+      const retryFx = rateLimitEffect(req);
+      if (retryFx !== null) {
+        sendJson(req, res, 429, { ok: false, error: "effect rate limit exceeded (60/min per identity)", retryAfterSeconds: retryFx });
         return;
       }
       const body = await readBody(req);

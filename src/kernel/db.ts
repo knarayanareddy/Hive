@@ -25,6 +25,14 @@ export class HiveStore {
   public db: DatabaseSync;
   public readonly filePath: string;
   private txDepth = 0;
+  /**
+   * Wall-clock virtual offset (ms). `hive tick --advance` fast-forwards the
+   * kernel's perception of "now" without touching wall time; it is process-local
+   * and resets to 0 on restart (leases then appear sooner, which fails safe).
+   * Never used in HIVE_CLOCK_MODE=sim (frozen test clock) — there, advanceClock
+   * persists sim_now_ms exactly as before.
+   */
+  private clockOffsetMs = 0;
 
   constructor(filePath = ":memory:") {
     this.filePath = filePath;
@@ -135,15 +143,22 @@ export class HiveStore {
   }
 
   public now(): number {
-    return this.getMeta().simNowMs;
+    // Wall-clock by default (M5). HIVE_CLOCK_MODE=sim freezes time at the seeded
+    // authority_meta.sim_now_ms baseline — tests only.
+    if (process.env.HIVE_CLOCK_MODE === "sim") return this.getMeta().simNowMs;
+    return Date.now() + this.clockOffsetMs;
   }
 
   public advanceClock(deltaMs: number): number {
-    const next = this.now() + deltaMs;
-    this.db
-      .prepare("UPDATE authority_meta SET sim_now_ms = ? WHERE singleton = 1")
-      .run(next);
-    return next;
+    if (process.env.HIVE_CLOCK_MODE === "sim") {
+      const next = this.getMeta().simNowMs + deltaMs;
+      this.db
+        .prepare("UPDATE authority_meta SET sim_now_ms = ? WHERE singleton = 1")
+        .run(next);
+      return next;
+    }
+    this.clockOffsetMs += deltaMs;
+    return this.now();
   }
 
   /**

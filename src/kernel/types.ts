@@ -49,14 +49,6 @@ export interface CapabilityClaims {
   chain: string[];
 }
 
-export interface RevisionToken {
-  tenant: string;
-  taskId: string;
-  revision: number;
-  epoch: number;
-  incarnation: string;
-}
-
 export interface InboundMessage {
   source: "slack" | "github" | "linear" | "cli" | "ui";
   principal: string;

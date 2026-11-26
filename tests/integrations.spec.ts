@@ -1,3 +1,4 @@
+import "./_setup";
 /**
  * Live integration gateway tests — NO real external network.
  *

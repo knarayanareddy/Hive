@@ -3,7 +3,6 @@ import {
   attestationPreimage,
   canonicalJson,
   computeEventId,
-  encodeRevisionToken,
   generateEd25519KeyPair,
   merkleRoot,
   mintCapabilityToken,
@@ -11,7 +10,6 @@ import {
   signEd25519,
   verifyCapabilityToken,
   verifyEd25519,
-  verifyRevisionToken,
 } from "./crypto";
 import { HiveStore } from "./db";
 import { CUSTODY_PURPOSES, decryptCustodial, encryptCustodial, masterKeyFromEnv } from "./custody";
@@ -60,6 +58,10 @@ const MAX_ATTEMPTS = 5;
 export class HiveKernel {
   public readonly store: HiveStore;
   public readonly connectors: EffectConnectorHub;
+  /** Bumped on every event-store mutation (append/tamper) so cached log verifications invalidate safely. */
+  private mutationEpoch = 0;
+  private readonly logVerifyCache = new Map<string, LogVerifyResult>();
+  private static readonly LOG_VERIFY_CACHE_LIMIT = 32;
 
   constructor(store?: HiveStore, connectors?: EffectConnectorHub) {
     this.store = store ?? new HiveStore(":memory:");
@@ -77,28 +79,6 @@ export class HiveKernel {
   public getIncarnation(): string {
     return this.store.getMeta().incarnation;
   }
-
-  public issueRevisionToken(tenantId: string, taskId: string): string {
-    const t = this.getTask(tenantId, taskId);
-    const meta = this.store.getMeta();
-    return encodeRevisionToken(
-      {
-        tenant: tenantId,
-        taskId: t.id,
-        revision: t.revision,
-        epoch: t.leaseEpoch,
-        incarnation: meta.incarnation,
-      },
-      this.store.gatewaySigningKey(),
-    );
-  }
-
-  public checkRevisionToken(tenantId: string, revToken: string) {
-    this.store.assertTenant(tenantId);
-    const meta = this.store.getMeta();
-    return verifyRevisionToken(revToken, meta.gatewayPub, tenantId, meta.incarnation);
-  }
-
   /* ========================================================================
    *  PRINCIPALS & OWNER ATTESTATIONS (BUZZ IDENTITY MODEL)
    * ====================================================================== */
@@ -656,6 +636,7 @@ export class HiveKernel {
           : "member"
         : "external");
 
+    const attest = params.attest ?? [];
     const id = computeEventId({
       prev,
       tenantId: tId,
@@ -666,11 +647,12 @@ export class HiveKernel {
       trust,
       payload: params.payload,
       createdAt,
+      attest,
     });
 
     const signerKey = principalRow ? principalRow.privkey : this.store.gatewaySigningKey();
+    this.mutationEpoch += 1;
     const sig = signEd25519(signerKey, id);
-    const attest = params.attest ?? [];
 
     const info = this.store.db
       .prepare(
@@ -893,8 +875,44 @@ export class HiveKernel {
   public verifyLog(tenantId: string, checkpointSelector?: string): LogVerifyResult {
     const tId = this.store.assertTenant(tenantId);
     const meta = this.store.getMeta();
+    // Other connections (drills, future PG runtime) don't bump mutationEpoch —
+    // data_version does. Same-connection writes are covered by mutationEpoch.
+    let dataVersion = 0;
+    try {
+      const row = this.store.db.prepare("PRAGMA data_version").get() as { data_version?: number } | undefined;
+      dataVersion = row && typeof row.data_version === "number" ? row.data_version : 0;
+    } catch {
+      dataVersion = 0;
+    }
+
+    // Resolve the checkpoint selector up-front so the cache key fully determines the result.
+    let chkId: string | null = null;
+    if (checkpointSelector) {
+      const chks = this.listCheckpoints(tId);
+      const chk =
+        checkpointSelector === "latest"
+          ? chks[0]
+          : chks.find((c) => c.id === checkpointSelector);
+      chkId = chk ? chk.id : `missing:${checkpointSelector}`;
+    }
+    const cacheKey = `${tId}:${checkpointSelector ?? "none"}:${chkId ?? "none"}:${this.mutationEpoch}:${meta.incarnation}:${dataVersion}`;
+    const cached = this.logVerifyCache.get(cacheKey);
+    if (cached) return cached;
+
+    const result = this.verifyLogUncached(tId, checkpointSelector);
+    if (this.logVerifyCache.size >= HiveKernel.LOG_VERIFY_CACHE_LIMIT) {
+      this.logVerifyCache.delete(this.logVerifyCache.keys().next().value!);
+    }
+    this.logVerifyCache.set(cacheKey, result);
+    return result;
+  }
+
+  private verifyLogUncached(tenantId: string, checkpointSelector?: string): LogVerifyResult {
+    const tId = tenantId;
+    const meta = this.store.getMeta();
     const evs = this.listEvents(tId, { limit: 50000 });
     let expectedPrev = "genesis";
+    // Memoized Ed25519 verify makes repeated snapshots cheap even on full re-verification.
 
     for (const ev of evs) {
       if (ev.prev !== expectedPrev) {
@@ -917,6 +935,7 @@ export class HiveKernel {
         trust: ev.trust,
         payload: ev.payload,
         createdAt: ev.createdAt,
+        attest: ev.attest,
       });
       if (recomputedId !== ev.id) {
         return {
@@ -950,6 +969,30 @@ export class HiveKernel {
           ? chks[0]
           : chks.find((c) => c.id === checkpointSelector);
       if (chk) {
+        const maxSeq = evs.length > 0 ? evs[evs.length - 1].seq : 0;
+        // Tail-truncation bound: a checkpoint covering seq U cannot outlive the
+        // deletion of tail events — if the log ends BEFORE the checkpoint claims to,
+        // rows were deleted underneath it. Reject.
+        if (chk.uptoSeq > maxSeq) {
+          return {
+            ok: false,
+            checkedEvents: evs.length,
+            checkpointVerified: false,
+            checkpointId: chk.id,
+            reason: `checkpoint ${chk.id} covers seq ${chk.uptoSeq} but the log ends at ${maxSeq} — tail truncation suspected`,
+          };
+        }
+        // The checkpoint's head binding must match the actual event at seq = uptoSeq.
+        const headEv = chk.uptoSeq > 0 ? evs.find((e) => e.seq === chk.uptoSeq) : undefined;
+        if (chk.uptoSeq > 0 && headEv && headEv.id !== chk.headEventId) {
+          return {
+            ok: false,
+            checkedEvents: evs.length,
+            checkpointVerified: false,
+            checkpointId: chk.id,
+            reason: `checkpoint ${chk.id} head_event_id does not match the event at seq ${chk.uptoSeq}`,
+          };
+        }
         const subset = evs.filter((e) => e.seq <= chk.uptoSeq);
         const expectedRoot = merkleRoot(subset.map((e) => e.id));
         const preimage = canonicalJson({
@@ -999,6 +1042,7 @@ export class HiveKernel {
     if (!row) throw new ValidationError(`no event at seq ${seq}`);
     const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
     payload.tampered = newText;
+    this.mutationEpoch += 1;
     this.store.db
       .prepare("UPDATE event SET payload_json = ? WHERE tenant_id = ? AND seq = ?")
       .run(canonicalJson(payload), tId, seq);
