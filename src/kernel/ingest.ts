@@ -1,4 +1,4 @@
-import { scanSecretSpans } from "./policy";
+import { redactSecretSpans, scanSecretSpans } from "./policy";
 import type { InboundMessage, Principal, Trust } from "./types";
 
 const INSTRUCTION_PATTERNS: { name: string; re: RegExp }[] = [
@@ -71,7 +71,8 @@ export function ingestInbound(raw: RawInboundInput): InboundMessage {
     principal: raw.principalId,
     trust,
     channel: raw.channel,
-    text: raw.text,
+    // Redact key-shaped secrets before persisting — flags above were computed on the raw text.
+    text: redactSecretSpans(raw.text),
     externalRef: raw.externalRef,
     flags: {
       instructionLike,

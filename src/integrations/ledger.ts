@@ -5,7 +5,8 @@
  * Slack's chat.postMessage has NO provider-side idempotency key. This ledger is
  * the second net (after the outbox's own status='confirmed' short-circuit) so a
  * crash between "provider returned 200" and "outbox row updated" does not cause
- * a duplicate post on retry.
+ * a duplicate post on retry. Entries are tenant-scoped; rows written before the
+ * tenantId field existed are ignored on read.
  *
  * Honest limitation: a crash inside the perform call that already reached the
  * provider is still undetectable without provider support; the Slack message
@@ -17,6 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export interface LedgerEntry {
+  tenantId: string;
   key: string;
   effect: string;
   receipt: Record<string, unknown>;
@@ -33,14 +35,14 @@ export class EffectLedger {
       path.resolve(process.cwd(), ".hive/live-ledger.jsonl");
   }
 
-  find(key: string, effect: string): Record<string, unknown> | null {
+  find(tenantId: string, key: string, effect: string): Record<string, unknown> | null {
     if (!fs.existsSync(this.file)) return null;
     for (const line of fs.readFileSync(this.file, "utf8").split("\n")) {
       const t = line.trim();
       if (!t) continue;
       try {
         const e = JSON.parse(t) as LedgerEntry;
-        if (e.key === key && e.effect === effect) {
+        if (e.tenantId === tenantId && e.key === key && e.effect === effect) {
           return { ...e.receipt, reconciledViaReadBack: true, via: "ledger" };
         }
       } catch {
@@ -50,7 +52,7 @@ export class EffectLedger {
     return null;
   }
 
-  append(entry: { key: string; effect: string; receipt: Record<string, unknown> }): void {
+  append(entry: { tenantId: string; key: string; effect: string; receipt: Record<string, unknown> }): void {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     const line: LedgerEntry = { ...entry, at: new Date().toISOString() };
     fs.appendFileSync(this.file, JSON.stringify(line) + "\n", "utf8");

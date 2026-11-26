@@ -173,6 +173,19 @@ export function scanSecretSpans(text: string): string[] {
 }
 
 /**
+ * Replace every secret-pattern span in `text` with `[REDACTED:<pattern_name>]`.
+ * Used by ingest to avoid persisting key-shaped material into the event log.
+ */
+export function redactSecretSpans(text: string): string {
+  let out = text;
+  for (const p of SECRET_PATTERNS) {
+    const flags = p.re.flags.includes("i") ? "gi" : "g";
+    out = out.replace(new RegExp(p.re.source, flags), `[REDACTED:${p.name}]`);
+  }
+  return out;
+}
+
+/**
  * Outbound Data Loss Prevention (DLP) check — blocks key-shaped secrets from being
  * posted into channels or synced out to Slack/GitHub.
  */

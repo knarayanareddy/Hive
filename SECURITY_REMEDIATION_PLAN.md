@@ -38,9 +38,9 @@ Every load-bearing claim below was re-verified against this repository before ac
 
 ## 3. Definition of done (per phase and overall)
 
-- `npm test` green — 12/12 existing chaos/integration specs (updated only where they exercised the
+- `npm test` green — all specs (12 chaos/integration + session/authz/webhooks/custody) pass (updated only where they exercised the
   vulnerable tokenless path) **plus** new specs listed in each phase.
-- `npm run verify:postgres` — 25/25 RLS checks (29/29 after PG parity lands).
+- `npm run verify:postgres` — 27/27 RLS checks (incl. principal_session + webhook_delivery).
 - `npm run drill:backup` — all PASS (now including stale-WAL restore drill).
 - Bearer-token matrix re-verified on a live local gateway for `/api/state`, `/api/cli`, `/api/reset`.
 - INFRASTRUCTURE.md states only what is true of the shipped tree.
@@ -226,3 +226,33 @@ checklist inside the repo (Phase 4) — do not revive the zips.
 - **DLP hard block in outbox** — false positive fails the *effect*, never the *audit trail*: the
   outbox row goes `failed` with DLP reason; approval/evidence tx already committed.
 - **Docs pass** — any INFRASTRUCTURE.md sentence that is not true of the merged tree is a defect.
+
+---
+
+## Execution log (updated 2026-11-26)
+
+- **Phase 0 code (this branch, PR #3 pending):** 0.1 per-principal sessions
+  (`hst_`, SHA-256 at rest, TTL 12h/24h cap, `principal_session` table, admin-gated
+  `/api/session/mint`, `/api/session/me|revoke`, 401 without session, UI sign-in +
+  401 banner, `activeTokens` leak removed, per-session `hct_` jars) · 0.2 kernel
+  fencing+human role gates (tokenless agents refused on pushPatch/runEffect/
+  postChannelMessage; member cannot task.verify; two_of_three requires
+  owner|lead|security; attestation revoke = owning human or owner; mint ∩
+  attestation scope; reject invalidates approvals; isMergeAllowed state-fenced;
+  MAX_ATTEMPTS=5 halt; cross-epoch loop breaker) · 0.3 merge path (prNumber from
+  confirmed open-pr receipt, `sha=` on PUT merge, `HIVE_GITHUB_REPO`, DLP at
+  drain, ingest redacts secret spans, patterns extended) · 0.4 commit-then-send
+  outbox + `reconcileOutbox()` at boot (pending→drained, merged→closed) + drill
+  gating (403 `/api/reset`, `/api/scenario`) + FTS integrity-check at restore +
+  stale-WAL drill + EffectLedger tenantId · 0.5 webhook HMAC receivers + 1 MiB
+  cap + 421 Host + loopback CORS · 0.6 `HIVE_MASTER_KEY` custodial envelope
+  (legacy re-encryption sweep) + `HIVE_GATEWAY_SIGNING_KEY` override · 0.7 docs
+  truth pass (INFRASTRUCTURE.md, .env.example, TODO.md).
+- **New specs (16/16 green):** `auth.session.spec.ts`, `authz.human.spec.ts`,
+  `webhooks.hmac.spec.ts`, `custody.spec.ts`; existing specs rewired off the
+  tokenless path (`gate.sha.spec.ts` now exercises reject→re-claim→push).
+- **PG RLS parity for the two new tables** landed in `001_postgres_rls.sql`
+  (strict `app.tenant_id <> ''` predicate) + `verify-postgres-rls.mjs` covers both
+  (27/27). Full `schema_def`/`channel_room`/`sim_now_ms` PG alignment (M1) remains
+  Phase 0.5/1 as planned.
+- **Not pushed / PR #3 not opened** — awaiting explicit user go-ahead (deploy posture).

@@ -13,8 +13,8 @@ Status of every item from the post-build review, what was done, what is
   wheel, unix socket) and exercised by `scripts/verify-postgres-rls.mjs`, which:
   recreates a throwaway database (`hive_rls_verify`, dropped afterwards), applies the
   migration twice (idempotent), grants least-privilege rights to a **non-superuser**
-  role `hive_rls_app`, seeds two tenants, and asserts **25/25 checks**:
-  ENABLE + FORCE RLS on all 12 tenant tables, default-deny (unset *and* empty
+  role `hive_rls_app`, seeds two tenants, and asserts **27/27 checks**:
+  ENABLE + FORCE RLS on all 14 tenant tables, default-deny (unset *and* empty
   `app.tenant_id`), cross-tenant SELECT/UPDATE/DELETE isolation, `WITH CHECK` insert
   denial, FTS5/GIN `tsvector` scoping, and read-only `authority_meta` bootstrap.
 - **Run it yourself:** `docker compose up -d postgres` then
@@ -46,7 +46,7 @@ into the **same** outbox path the 10 chaos specs exercise:
   `live` (fail fast at boot if GitHub or Slack unresolvable) · `simulation`
   (never touches network). A configured-live category **never silently falls back**
   — network failure marks the outbox row `failed` and it stays retryable.
-- **Verified by `tests/integrations.spec.ts`** (runs in `npm test`, 12/12 green):
+- **Verified by `tests/integrations.spec.ts`** (runs in `npm test`, 16/16 green):
   mock GitHub + mock Slack on 127.0.0.1 *as separate processes* (the kernel's
   effect path is synchronous curl — in-process mocks deadlock). Covers outbox-confirmed
   PR creation, idempotent replay (1 POST only), fresh-key read-back after a simulated
@@ -62,9 +62,12 @@ into the **same** outbox path the 10 chaos specs exercise:
 - **Honest limitation:** the live path was verified against mocks + API-shape review,
   not against real GitHub/Slack — the sandbox allowlist blocks `api.slack.com`/`slack.com`,
   and no user-provided GitHub token/repo exists yet. The first real call is one env var away.
-- **Not done (by design):** no webhook receiver for inbound GitHub/Slack events yet
-  (the ingest pipeline accepts messages via `/api/ingest`, but nothing scrapes a
-  webhook URL). Requires a publicly reachable gateway — see §5.
+- **Inbound webhooks (2026-11-26):** `POST /api/webhooks/github` and `POST /api/webhooks/slack`
+  verify HMAC-SHA256 signatures (`X-Hub-Signature-256` / `v0=` scheme) with `timingSafeEqual`
+  **before parsing**, enforce a 300s replay window on Slack timestamps, dedup deliveries via the
+  `webhook_delivery` table, and ingest into `HIVE_WEBHOOK_TENANT` as quarantined external
+  messages (`HIVE_WEBHOOK_CHANNEL`). An unset webhook secret fails closed (503). Request bodies
+  are capped at 1 MiB (413). Nothing is registered on a public URL yet — that needs §5.
 
 ## 3. Browser-level QA — ⚠️ NOT PERFORMED IN-SANDBOX (no browser binary exists here)
 
@@ -89,8 +92,8 @@ into the **same** outbox path the 10 chaos specs exercise:
 
 ## 5. Push / deploy — ✅ BRANCH PUSHED · Vercel ready, deploy not triggered (needs your go-ahead)
 
-- Branch `arena/446b8aab-hive` is pushed to `origin` (commit at HEAD includes this
-  infra pass).
+- Branch `arena/446b8aab-hive` is pushed to `origin` (security remediation commits:
+  see `SECURITY_REMEDIATION_PLAN.md` execution log). PR #3 (remediation) opens on your go-ahead.
 - `vercel.json` ships: Vite framework preset, `npm ci` install, `npm run build`,
   `dist` output, SPA fallback rewrites. **The static frontend deploys cleanly as-is.**
   What it does *not* get you: a reachable `/api` — Vercel serverless would need a
@@ -106,15 +109,45 @@ into the **same** outbox path the 10 chaos specs exercise:
   URL registered in GitHub/Slack. This is the recommended next milestone — it is
   intentionally not auto-deployed.
 
-## 6. Production hardening — ✅ BASELINE SHIPPED · residual items listed honestly
+## 6. Production hardening — ✅ BASELINE + PHASE-0 REMEDIATION SHIPPED · residual items listed honestly
 
-Shipped and verified in this pass:
+Shipped and verified in this pass (2026-11-26):
+- **Per-principal sessions**: HTTP routes derive `(tenant, actor)` exclusively from
+  `hst_<base64url(32B)>` sessions (SHA-256-hashed at rest in `principal_session`,
+  12h default TTL, 24h cap, `timingSafeEqual` on hashes, `revoked` flag,
+  `last_used_at`). Minting requires `HIVE_ADMIN_TOKEN` (≥32 chars; mandatory in
+  production, else boot refuses). Body/query `actor` honored only under
+  `HIVE_DEV_INSECURE_ACTOR=1` (loud boot warning; refused in production).
+  `/api/state` no longer leaks `activeTokens`. `hct_` capability jar is keyed per
+  session (200-entry LRU), never global per tenant.
+- **Admin/drills gating**: `/api/reset` and `/api/scenario` return 403 unless
+  `HIVE_ENABLE_DEV_DRILLS=1`; `/api/reset` additionally requires the admin token
+  (fs.rmSync of the DB is no longer reachable unauthenticated).
+- **Custodial keys**: `HIVE_MASTER_KEY` (AES-256-GCM) envelope-encrypts
+  `principal.privkey` and `authority_meta.gateway_priv` at rest; legacy plaintext
+  re-encrypts in place at boot; `HIVE_GATEWAY_SIGNING_KEY` overrides the DB copy for
+  signing; required in production.
+- **Commit-then-send outbox**: effects stage as `pending` inside the kernel
+  transaction; DLP/read-after-write/perform run post-commit (`drainOutboxEffect`);
+  a crashed drain is re-driven by `kernel.reconcileOutbox()` at server boot;
+  confirmed merges close tasks stuck pre-`merged→closed`. Effect ledger is
+  tenant-scoped.
+- **Human authz hardening**: role-gated `task.verify` (owner|lead|security|verifier),
+  `two_of_three` security gates require owner|lead|security, approver must hold
+  channel `post` access, rejects invalidate outstanding approvals for the SHA,
+  attestation revoke/restore restricted to the owning human or an `owner`,
+  minted `hct_` ops are the intersection with Owner Attestation scope, agents are
+  fenced out of tokenless `pushPatch`/`runEffect`/`postChannelMessage`.
+- **Inbound webhook HMAC** (see §2) + 1 MiB body cap (413) + foreign-`Host` → 421
+  (`HIVE_ALLOWED_HOSTS`, `GET /api/health` exempt) + CORS restricted to loopback
+  origins (or `HIVE_ALLOWED_ORIGINS`), `Authorization` in Allow-Headers.
+
+Shipped previously (baseline):
 - **Gateway auth**: `HIVE_GATEWAY_TOKEN` — when set, all `/api/*` except
   `GET /api/health` require `Authorization: Bearer <token>` (verified live:
-  401 without/with wrong token, 200 with, health stays open). UI sends the token
-  when `VITE_HIVE_API_TOKEN` is set; note: the UI currently does **not** check
-  `res.ok`, so a 401 renders a blank/error surface instead of an explicit auth banner —
-  tracked in `SECURITY_REMEDIATION_PLAN.md` (Phase 3, H6) and scheduled there.
+  401 without/with wrong token, 200 with, health stays open). The UI now also
+  renders an explicit sign-in panel and a 401 banner (2026-11-26); full
+  401/error-surface design is Phase 3 (H6).
 - **Backup/PITR drill**: `npm run drill:backup` — seed → claim → snapshot → mutate →
   restore against real DB files; asserts incarnation rotation, pre-restore token
   rejection, `FTS5` survival, hash-chain verification. **All 6 checks pass.**
@@ -130,10 +163,13 @@ Shipped and verified in this pass:
   Postgres 16 RLS verification job.
 
 Residual, not done (needs real infrastructure / decisions from you):
-- No TLS termination, rate limiting, or WAF on the gateway (front it with a proxy or
-  platform that provides them; do not expose `:8787` raw to the internet).
-- No secrets manager integration (Vault/SM/Doppler); env vars only.
+- No TLS termination or WAF on the gateway (front it with a proxy or platform that
+  provides them; do not expose `:8787` raw to the internet).
+- No per-identity rate limiting yet (Phase 1, H7/M: token buckets 6000 req/min).
+- No secrets manager integration (Vault/SM/Doppler); env vars + KMS-backed key custody options.
 - No queue worker for exactly-once external effects (Slack gap, see §2).
 - No `pg`-backed runtime store (see §1); SQLite is single-process.
+- `/api/state` re-verifies the full signed log per call (p95 ≈ 168ms) — incremental
+  verification cache is Phase 1 (M2).
 - No alerting/metrics (`call_telemetry` table is populated; nothing exports it yet).
 - Backup cadence/retention is your job (`VACUUM INTO` snapshots are on-demand only).

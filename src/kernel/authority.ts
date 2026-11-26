@@ -14,6 +14,7 @@ import {
   verifyRevisionToken,
 } from "./crypto";
 import { HiveStore } from "./db";
+import { CUSTODY_PURPOSES, decryptCustodial, encryptCustodial, masterKeyFromEnv } from "./custody";
 import { ingestInbound, type RawInboundInput } from "./ingest";
 import { EffectConnectorHub } from "./outbox";
 import {
@@ -116,7 +117,7 @@ export class HiveKernel {
          (id, tenant_id, kind, pubkey, privkey, owner, harness, role, attest_scope, attest_not_after, attest_revoked, attest_sig, created_at)
          VALUES (?, ?, 'human', ?, ?, NULL, NULL, ?, NULL, NULL, 0, NULL, ?)`,
       )
-      .run(params.id, tId, kp.publicKey, kp.privateKey, role, now);
+      .run(params.id, tId, kp.publicKey, this.custodialPrivate(kp.privateKey), role, now);
     return this.getPrincipal(tId, params.id)!;
   }
 
@@ -162,7 +163,7 @@ export class HiveKernel {
         params.id,
         tId,
         kp.publicKey,
-        kp.privateKey,
+        this.custodialPrivate(kp.privateKey),
         params.owner,
         params.harness,
         params.role ?? "worker",
@@ -189,6 +190,11 @@ export class HiveKernel {
       const agent = this.getPrincipalWithSecret(tId, agentId);
       if (!agent || agent.kind !== "agent" || !agent.owner) {
         throw new ValidationError(`no such agent: ${agentId}`);
+      }
+      if (agent.owner !== actor.id && actor.role !== "owner") {
+        throw new ForbiddenError(
+          `only the owning human "${agent.owner}" or an "owner" may ${op} the attestation of "${agentId}"`,
+        );
       }
       const ownerRow = this.getPrincipalWithSecret(tId, agent.owner)!;
       const now = this.now();
@@ -247,8 +253,13 @@ export class HiveKernel {
     });
   }
 
+  private custodialPrivate(plainB64: string): string {
+    const masterKey = masterKeyFromEnv();
+    return masterKey ? encryptCustodial(plainB64, masterKey, CUSTODY_PURPOSES.principal) : plainB64;
+  }
+
   private getPrincipalWithSecret(tenantId: string, id: string) {
-    return this.store.db
+    const row = this.store.db
       .prepare("SELECT * FROM principal WHERE tenant_id = ? AND id = ?")
       .get(tenantId, id) as
       | {
@@ -266,6 +277,13 @@ export class HiveKernel {
           attest_sig: string | null;
         }
       | undefined;
+    if (row && row.privkey) {
+      return {
+        ...row,
+        privkey: decryptCustodial(row.privkey, masterKeyFromEnv(), CUSTODY_PURPOSES.principal),
+      };
+    }
+    return row;
   }
 
   public getPrincipal(tenantId: string, id: string): Principal | undefined {
@@ -2199,6 +2217,16 @@ export class HiveKernel {
   ): { allowed: boolean; reason: string } {
     const tId = this.store.assertTenant(tenantId);
     const task = this.getTask(tId, taskId);
+    const gate = gatePolicyForTask(task);
+    const stateOk =
+      task.state === "awaiting_approval" ||
+      (task.state === "verifying" && gate === "none");
+    if (!stateOk) {
+      return {
+        allowed: false,
+        reason: `task #${task.id} is in state "${task.state}"; merge is only allowed from 'awaiting_approval' (gate satisfied) or 'verifying' (no gate)`,
+      };
+    }
     if (!task.headSha) {
       return { allowed: false, reason: "no head_sha recorded on task" };
     }
@@ -2414,6 +2442,84 @@ export class HiveKernel {
       this.unblockDependents(tId, task.id);
       return this.getTask(tId, taskId);
     });
+  }
+
+  /**
+   * Boot-time outbox reconcile (H2/H4 durability). Re-drives effects that were
+   * staged or marked sent but never confirmed (e.g. process crashed between the
+   * provider call and the confirm write), and closes tasks whose merge effect is
+   * confirmed but whose merged→closed CAS never ran. Idempotent — a clean boot
+   * does zero work.
+   */
+  public reconcileOutbox(tenantId: string): {
+    drained: number;
+    closed: number;
+    failed: number;
+  } {
+    const tId = this.store.assertTenant(tenantId);
+    const stash = this.store.db
+      .prepare(
+        `SELECT idempotency_key FROM outbox
+         WHERE tenant_id = ? AND status IN ('pending', 'sent')
+         ORDER BY created_at ASC`,
+      )
+      .all(tId) as { idempotency_key: string }[];
+    let drained = 0;
+    let failed = 0;
+    for (const row of stash) {
+      try {
+        this.drainOutboxEffect(tId, row.idempotency_key, "hive-kernel");
+        drained++;
+      } catch (err) {
+        failed++;
+        this.appendEvent(tId, {
+          kind: "outbox.reconcile_failed",
+          actor: "hive-kernel",
+          channel: null,
+          taskId: null,
+          payload: {
+            idempotencyKey: row.idempotency_key,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
+      }
+    }
+
+    const stuck = this.store.db
+      .prepare(
+        `SELECT id, head_sha AS headSha FROM task
+         WHERE tenant_id = ? AND state IN ('awaiting_approval', 'verifying', 'merged')
+           AND head_sha IS NOT NULL`,
+      )
+      .all(tId) as { id: string; headSha: string }[];
+    let closed = 0;
+    for (const t of stuck) {
+      const mergeKey = `task:${t.id}/sha:${t.headSha}/merge`;
+      const confirmed = this.store.db
+        .prepare(
+          `SELECT 1 AS ok FROM outbox
+           WHERE tenant_id = ? AND idempotency_key = ? AND status = 'confirmed'`,
+        )
+        .get(tId, mergeKey) as { ok: number } | undefined;
+      if (!confirmed) continue;
+      try {
+        this.finalizeVerifiedClose(tId, t.id, "hive-kernel");
+        closed++;
+      } catch (err) {
+        this.appendEvent(tId, {
+          kind: "outbox.reconcile_close_failed",
+          actor: "hive-kernel",
+          channel: null,
+          taskId: t.id,
+          payload: {
+            taskId: t.id,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
+      }
+    }
+
+    return { drained, closed, failed };
   }
 
   private unblockDependents(tenantId: string, closedTaskId: string) {

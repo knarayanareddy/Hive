@@ -111,14 +111,14 @@ export class LiveEffectConnectorHub extends EffectConnectorHub {
         if (hit) return hit;
       } catch (err) {
         // Provider unreachable → fall back to local ledger before giving up.
-        const ledgerHit = this.ledger.find(key, effect);
+        const ledgerHit = this.ledger.find(tenantId, key, effect);
         if (ledgerHit) return ledgerHit;
         throw err;
       }
       return null;
     }
     if (slack && effect === "post-slack") {
-      return this.ledger.find(key, effect);
+      return this.ledger.find(tenantId, key, effect);
     }
     return super.findExisting(tenantId, effect, args, key);
   }
@@ -140,7 +140,7 @@ export class LiveEffectConnectorHub extends EffectConnectorHub {
       return super.perform(tenantId, effect, args, key); // simulation path (DLP inside)
     }
 
-    this.ledger.append({ key, effect, receipt });
+    this.ledger.append({ tenantId, key, effect, receipt });
     return receipt;
   }
 }

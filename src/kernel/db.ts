@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { CUSTODY_PURPOSES, decryptCustodial, encryptCustodial, isEncryptedCustodial, masterKeyFromEnv } from "./custody";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
@@ -47,12 +48,46 @@ export class HiveStore {
     if (!existing) {
       const kp = generateEd25519KeyPair();
       const now = 1795606800000; // 2026-11-25T09:00:00Z baseline
+      const masterKey = masterKeyFromEnv();
+      const storedPriv = masterKey
+        ? encryptCustodial(kp.privateKey, masterKey, CUSTODY_PURPOSES.gateway)
+        : kp.privateKey;
       this.db
         .prepare(
           `INSERT INTO authority_meta (singleton, incarnation, gateway_pub, gateway_priv, sim_now_ms, rotated_at)
            VALUES (1, ?, ?, ?, ?, ?)`,
         )
-        .run(crypto.randomUUID(), kp.publicKey, kp.privateKey, now, now);
+        .run(crypto.randomUUID(), kp.publicKey, storedPriv, now, now);
+    } else {
+      this.encryptLegacyCustodialRows();
+    }
+  }
+
+  /**
+   * One-time sweep: when HIVE_MASTER_KEY is configured, re-encrypt any custodial
+   * private keys still stored as legacy plaintext (principal.privkey,
+   * authority_meta.gateway_priv). Idempotent; a no-op once all rows are encrypted.
+   */
+  private encryptLegacyCustodialRows() {
+    const masterKey = masterKeyFromEnv();
+    if (!masterKey) return;
+    const gw = this.db
+      .prepare("SELECT gateway_priv FROM authority_meta WHERE singleton = 1")
+      .get() as { gateway_priv: string } | undefined;
+    if (gw && !isEncryptedCustodial(gw.gateway_priv)) {
+      this.db
+        .prepare("UPDATE authority_meta SET gateway_priv = ? WHERE singleton = 1")
+        .run(encryptCustodial(gw.gateway_priv, masterKey, CUSTODY_PURPOSES.gateway));
+    }
+    const plain = this.db
+      .prepare("SELECT tenant_id, id, privkey FROM principal WHERE privkey NOT LIKE 'enc:v1:%'")
+      .all() as { tenant_id: string; id: string; privkey: string }[];
+    const upd = this.db.prepare("UPDATE principal SET privkey = ? WHERE tenant_id = ? AND id = ?");
+    for (const row of plain) {
+      upd.run(encryptCustodial(row.privkey, masterKey, CUSTODY_PURPOSES.principal), row.tenant_id, row.id);
+    }
+    if (plain.length > 0) {
+      console.log(`[hive-custody] re-encrypted ${plain.length} legacy plaintext principal key(s) under HIVE_MASTER_KEY`);
     }
   }
 
@@ -93,7 +128,7 @@ export class HiveStore {
     return {
       incarnation: row.incarnation,
       gatewayPub: row.gateway_pub,
-      gatewayPriv: row.gateway_priv,
+      gatewayPriv: decryptCustodial(row.gateway_priv, masterKeyFromEnv(), CUSTODY_PURPOSES.gateway),
       simNowMs: Number(row.sim_now_ms),
       rotatedAt: Number(row.rotated_at),
     };
@@ -163,6 +198,14 @@ export class HiveStore {
     }
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA foreign_keys = ON;");
+    // FTS5 integrity-check: a snapshot whose FTS shadow tables were mid-write at
+    // snapshot time must fail loudly here rather than serve phantom/missing rows.
+    const fts = this.db
+      .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'event_fts'")
+      .get() as { ok: number } | undefined;
+    if (fts) {
+      this.db.exec("INSERT INTO event_fts(event_fts) VALUES('integrity-check')");
+    }
     return rotateInc ? this.rotateIncarnation() : this.getMeta().incarnation;
   }
 

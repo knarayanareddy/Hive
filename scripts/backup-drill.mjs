@@ -55,6 +55,10 @@ const patch = kernel.pushPatch(DEFAULT_TENANT, {
 });
 console.log(`· post-snapshot mutation committed: patch @ ${patch.headSha ?? "3fa9c1"}`);
 
+// 3b. Plant stale WAL/SHM garbage next to the live DB — restore must discard them (H9)
+fs.writeFileSync(dbPath + "-wal", Buffer.from("stale-wal-garbage-from-a-crashed-writer", "utf8"));
+fs.writeFileSync(dbPath + "-shm", Buffer.from("stale-shm-garbage", "utf8"));
+
 // 4. Restore → incarnation must rotate
 const inc1 = store.restoreFromBackupTempFile(backup);
 console.log(`· restored from snapshot; incarnation rotated: ${inc0} → ${inc1}`);
@@ -80,7 +84,7 @@ const hits = kernel.searchEvents(DEFAULT_TENANT, "checkout");
 ok("FTS5 search works after restore", hits.length > 0, `${hits.length} hit(s)`);
 
 // 8. Hash chain still verifies (checkpoint survived the restore)
-const verification = kernel.verifyLog(DEFAULT_TENANT);
+const verification = kernel.verifyLog(DEFAULT_TENANT, "latest");
 ok("hash-chain verification passes on restored log", verification.ok, `checked=${verification.checkedEvents}`);
 
 // cleanup

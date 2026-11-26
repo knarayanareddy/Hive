@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -5,6 +6,18 @@ import { URL } from "node:url";
 import { HiveStore } from "../kernel/db";
 import { HiveKernel } from "../kernel/authority";
 import { DEFAULT_TENANT, seedWorkspace } from "../kernel/seed";
+import {
+  mintSession,
+  resolveSession,
+  revokeAllSessionsForPrincipal,
+  revokeSession,
+  SESSION_TTL_DEFAULT_MS,
+} from "../kernel/session";
+import {
+  claimWebhookDelivery,
+  verifyGitHubWebhook,
+  verifySlackWebhook,
+} from "./webhooks";
 import { executeHiveCli } from "../cli/parser";
 import { resolveEffectHub, integrationStatus } from "../integrations";
 import {
@@ -20,20 +33,73 @@ const HOST = process.env.HIVE_API_HOST ?? "0.0.0.0";
 const DB_PATH =
   process.env.HIVE_DB_PATH ?? path.resolve(process.cwd(), ".hive/live.db");
 const GATEWAY_TOKEN = process.env.HIVE_GATEWAY_TOKEN?.trim() || null;
+const ADMIN_TOKEN = process.env.HIVE_ADMIN_TOKEN?.trim() || null;
+const NODE_ENV = process.env.NODE_ENV ?? "development";
+const REQUIRE_ADMIN = NODE_ENV === "production" || process.env.HIVE_REQUIRE_ADMIN === "1";
+const DEV_INSECURE_ACTOR = process.env.HIVE_DEV_INSECURE_ACTOR === "1";
+const DEV_DRILLS = process.env.HIVE_ENABLE_DEV_DRILLS === "1";
+const ALLOWED_ORIGINS = (process.env.HIVE_ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const ALLOWED_HOSTS = (process.env.HIVE_ALLOWED_HOSTS ?? "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+const LOOPBACK_ORIGINS = [/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/];
+
+// ── Boot-time safety rails ─────────────────────────────────────────────────
+if (REQUIRE_ADMIN && !ADMIN_TOKEN) {
+  console.error(
+    "FATAL: HIVE_ADMIN_TOKEN (>=32 chars) is required when NODE_ENV=production or HIVE_REQUIRE_ADMIN=1. Refusing to listen.",
+  );
+  process.exit(1);
+}
+if (REQUIRE_ADMIN && !process.env.HIVE_MASTER_KEY?.trim()) {
+  console.error(
+    "FATAL: HIVE_MASTER_KEY (32 bytes, base64) is required when NODE_ENV=production or HIVE_REQUIRE_ADMIN=1 — custodial keys must not rest as plaintext. Refusing to listen.",
+  );
+  process.exit(1);
+}
+if (ADMIN_TOKEN && ADMIN_TOKEN.length < 32) {
+  console.error("FATAL: HIVE_ADMIN_TOKEN must be at least 32 characters. Refusing to listen.");
+  process.exit(1);
+}
+if (NODE_ENV === "production" && DEV_INSECURE_ACTOR) {
+  console.error("FATAL: HIVE_DEV_INSECURE_ACTOR must never be set in production. Refusing to listen.");
+  process.exit(1);
+}
+if (DEV_INSECURE_ACTOR) {
+  console.warn(
+    "⚠ HIVE_DEV_INSECURE_ACTOR=1 — HTTP routes trust body/query `actor` without any session. NEVER set this outside local dev.",
+  );
+}
+if (!ADMIN_TOKEN) {
+  console.warn(
+    "⚠ HIVE_ADMIN_TOKEN is not set — /api/session/mint and /api/reset are open to any local caller (dev convenience). Set it before any network exposure.",
+  );
+}
 
 let store = new HiveStore(DB_PATH);
 let kernel = new HiveKernel(store, resolveEffectHub());
 seedWorkspace(kernel, "acme");
 seedWorkspace(kernel, "globex");
 
-const tokenJarsByTenant: Record<string, Record<string, string>> = {
-  acme: {},
-  globex: {},
-};
+// hct_ capability-token jars are keyed PER SESSION (or per dev actor), never global per tenant.
+const tokenJars = new Map<string, Record<string, string>>();
+const MAX_TOKEN_JARS = 200;
 
-function getJar(tenant: string): Record<string, string> {
-  if (!tokenJarsByTenant[tenant]) tokenJarsByTenant[tenant] = {};
-  return tokenJarsByTenant[tenant];
+function jarFor(key: string): Record<string, string> {
+  let jar = tokenJars.get(key);
+  if (!jar) {
+    if (tokenJars.size >= MAX_TOKEN_JARS) {
+      const oldest = tokenJars.keys().next().value;
+      if (oldest !== undefined) tokenJars.delete(oldest);
+    }
+    jar = {};
+    tokenJars.set(key, jar);
+  }
+  return jar;
 }
 
 function resetAll() {
@@ -47,30 +113,119 @@ function resetAll() {
   kernel = new HiveKernel(store, resolveEffectHub());
   seedWorkspace(kernel, "acme");
   seedWorkspace(kernel, "globex");
-  tokenJarsByTenant.acme = {};
-  tokenJarsByTenant.globex = {};
+  tokenJars.clear();
+}
+
+const BODY_CAP_BYTES = 1024 * 1024; // 1 MiB
+
+/** Read the raw request body with a hard 1 MiB cap; throws HiveError(413) past the cap. */
+async function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const ch of req) {
+    const buf = Buffer.isBuffer(ch) ? ch : Buffer.from(ch);
+    total += buf.length;
+    if (total > BODY_CAP_BYTES) {
+      throw new HiveError(413, "BODY_TOO_LARGE", "request body exceeds the 1 MiB cap");
+    }
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks);
 }
 
 async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = [];
-  for await (const ch of req) {
-    chunks.push(Buffer.isBuffer(ch) ? ch : Buffer.from(ch));
-  }
-  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  const raw = (await readRawBody(req)).toString("utf8").trim();
   if (!raw) return {};
   return JSON.parse(raw) as Record<string, unknown>;
 }
 
-function sendJson(res: http.ServerResponse, status: number, payload: unknown) {
+function originAllowed(origin: string): boolean {
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  return LOOPBACK_ORIGINS.some((re) => re.test(origin));
+}
+
+function corsHeaders(req: http.IncomingMessage): Record<string, string> {
+  const origin = req.headers.origin;
+  const base = {
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Hub-Signature-256, X-Slack-Signature, X-Slack-Request-Timestamp, X-GitHub-Delivery",
+    "Access-Control-Max-Age": "600",
+    Vary: "Origin",
+  };
+  if (origin && originAllowed(origin)) {
+    return { ...base, "Access-Control-Allow-Origin": origin };
+  }
+  return base; // no Allow-Origin header -> browser blocks cross-origin reads
+}
+
+function hostAllowed(req: http.IncomingMessage): boolean {
+  if (ALLOWED_HOSTS.length === 0) return true; // dev default; set HIVE_ALLOWED_HOSTS in prod
+  const host = (req.headers.host ?? "").split(":")[0].toLowerCase();
+  return host.length > 0 && ALLOWED_HOSTS.includes(host);
+}
+
+function sendJson(req: http.IncomingMessage, res: http.ServerResponse, status: number, payload: unknown) {
   const body = JSON.stringify(payload);
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    ...corsHeaders(req),
   });
   res.end(body);
+}
+
+function bearer(req: http.IncomingMessage): string | null {
+  const m = /^Bearer\s+(\S+)\s*$/i.exec(req.headers.authorization ?? "");
+  return m ? m[1] : null;
+}
+
+function timingSafeTokenEqual(presented: string, expected: string): boolean {
+  const a = crypto.createHash("sha256").update(presented).digest();
+  const b = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+/** Admin bootstrap: session minting / reset. Dev-open with a warning when unset; always required in prod. */
+function adminAuthorized(req: http.IncomingMessage): boolean {
+  if (!ADMIN_TOKEN) return !REQUIRE_ADMIN;
+  const token = bearer(req);
+  return token !== null && timingSafeTokenEqual(token, ADMIN_TOKEN);
+}
+
+interface RequestContext {
+  tenant: string;
+  actor: string;
+  jarKey: string;
+  via: "session" | "dev-insecure";
+}
+
+/**
+ * Resolve (tenant, actor) exclusively from the hst_ session bearer. Body/query
+ * identity is honoured only under HIVE_DEV_INSECURE_ACTOR=1 (local dev demo).
+ */
+function resolveContext(
+  req: http.IncomingMessage,
+  url: URL,
+  bodyTenant?: string,
+  bodyActor?: string,
+): RequestContext | null {
+  const token = bearer(req);
+  if (token && token.startsWith("hst_")) {
+    const session = resolveSession(store.db, token);
+    if (session) {
+      return {
+        tenant: session.tenantId,
+        actor: session.principalId,
+        jarKey: `s:${session.sessionHash}`,
+        via: "session",
+      };
+    }
+    return null; // presented an hst_ token that is expired/revoked/unknown -> 401, never fall through
+  }
+  if (!DEV_INSECURE_ACTOR) return null;
+  const tenant = bodyTenant ?? url.searchParams.get("tenant") ?? DEFAULT_TENANT;
+  const actor = bodyActor ?? url.searchParams.get("actor") ?? "ana";
+  return { tenant, actor, jarKey: `dev:${tenant}:${actor}`, via: "dev-insecure" };
 }
 
 function runLiveChaosSuite() {
@@ -195,7 +350,11 @@ function runLiveChaosSuite() {
     k.submitTask(DEFAULT_TENANT, { taskId: "801", token: c.token, headSha: "3fa9c1", evidenceRefs: [] });
     k.verifyTask(DEFAULT_TENANT, { actor: "verifier", taskId: "801", headSha: "3fa9c1", result: "pass" });
     k.decideGate(DEFAULT_TENANT, { actor: "ana", taskId: "801", headSha: "3fa9c1", decision: "approve", autoShip: false });
-    k.pushPatch(DEFAULT_TENANT, { taskId: "801", headSha: "newsha2", diff: "+sneaky", actor: "fixer" });
+    // Agent cannot push without an active lease: changes first go back to the human,
+    // then re-claim and push under a NEW lease (fencing).
+    k.decideGate(DEFAULT_TENANT, { actor: "ana", taskId: "801", headSha: "3fa9c1", decision: "reject", comment: "sneaky follow-up needed" });
+    const c2 = k.claimTask(DEFAULT_TENANT, { taskId: "801", actor: "fixer" });
+    k.pushPatch(DEFAULT_TENANT, { taskId: "801", headSha: "newsha2", diff: "+sneaky", token: c2.token });
     if (k.isMergeAllowed(DEFAULT_TENANT, "801").allowed) throw new Error("stale approval survived push");
     return `push newsha2 invalidated prior approval on 3fa9c1 & forced re-verification`;
   });
@@ -264,20 +423,27 @@ function runLiveChaosSuite() {
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
-    sendJson(res, 200, { ok: true });
+    res.writeHead(204, corsHeaders(req));
+    res.end();
+    return;
+  }
+
+  // Foreign Host -> 421 (all routes except the health probe).
+  if (!hostAllowed(req) && !(req.method === "GET" && req.url === "/api/health")) {
+    sendJson(req, res, 421, { ok: false, error: "misdirected request: Host not allowed" });
     return;
   }
 
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
   const pathname = url.pathname;
 
-  // Optional gateway bearer auth (HIVE_GATEWAY_TOKEN). When set, everything
-  // except GET /api/health requires `Authorization: Bearer <token>` — including
-  // GET /api/state, which leaks tenant data. Health stays open for probes.
+  // Legacy coarse gateway bearer (HIVE_GATEWAY_TOKEN) — kept ONLY as an outer
+  // network edge for e.g. reverse proxies; it carries NO principal identity.
+  // Per-principal hst_ sessions below are the authority for (tenant, actor).
   if (GATEWAY_TOKEN && !(req.method === "GET" && pathname === "/api/health")) {
-    const auth = req.headers.authorization ?? "";
-    if (auth !== `Bearer ${GATEWAY_TOKEN}`) {
-      sendJson(res, 401, {
+    const token = bearer(req);
+    if (!token || !timingSafeTokenEqual(token, GATEWAY_TOKEN)) {
+      sendJson(req, res, 401, {
         ok: false,
         error: "gateway bearer token required (set HIVE_GATEWAY_TOKEN on server and send Authorization: Bearer <token>)",
       });
@@ -287,7 +453,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (req.method === "GET" && pathname === "/api/health") {
-      sendJson(res, 200, {
+      sendJson(req, res, 200, {
         ok: true,
         incarnation: kernel.getIncarnation(),
         now: kernel.now(),
@@ -295,51 +461,172 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ── Webhooks: HMAC-verified, deduped, BEFORE any JSON parse ─────────────
+    if (req.method === "POST" && (pathname === "/api/webhooks/github" || pathname === "/api/webhooks/slack")) {
+      const source = pathname.endsWith("github") ? "github" : "slack";
+      const raw = await readRawBody(req);
+      const check =
+        source === "github"
+          ? verifyGitHubWebhook(
+              process.env.HIVE_GITHUB_WEBHOOK_SECRET?.trim(),
+              raw,
+              req.headers["x-hub-signature-256"] as string | undefined,
+              req.headers["x-github-delivery"] as string | undefined,
+            )
+          : verifySlackWebhook(
+              process.env.HIVE_SLACK_SIGNING_SECRET?.trim(),
+              raw,
+              req.headers["x-slack-request-timestamp"] as string | undefined,
+              req.headers["x-slack-signature"] as string | undefined,
+            );
+      if (!check.ok) {
+        sendJson(req, res, check.status, { ok: false, error: check.error });
+        return;
+      }
+      const tenant = process.env.HIVE_WEBHOOK_TENANT?.trim() || DEFAULT_TENANT;
+      const channel = process.env.HIVE_WEBHOOK_CHANNEL?.trim() || "integrations";
+      const first = claimWebhookDelivery(store.db, tenant, source, check.deliveryId!);
+      if (!first) {
+        sendJson(req, res, 200, { ok: true, deduplicated: true, deliveryId: check.deliveryId });
+        return;
+      }
+      const inbound = kernel.ingestMessage(tenant, {
+        source,
+        principalId: `${source}-webhook`,
+        channel,
+        text: raw.toString("utf8").slice(0, 4000),
+      });
+      sendJson(req, res, 200, { ok: true, deliveryId: check.deliveryId, inbound });
+      return;
+    }
+
+    // ── Session bootstrap (admin-gated) ─────────────────────────────────────
+    if (req.method === "POST" && pathname === "/api/session/mint") {
+      if (!adminAuthorized(req)) {
+        sendJson(req, res, 403, { ok: false, error: "admin token required to mint sessions (HIVE_ADMIN_TOKEN)" });
+        return;
+      }
+      const body = await readBody(req);
+      const tenant = String(body.tenant ?? DEFAULT_TENANT);
+      const principalId = String(body.principalId ?? "");
+      const ttlMs = body.ttlSeconds ? Math.min(Number(body.ttlSeconds) * 1000, 24 * 3600 * 1000) : SESSION_TTL_DEFAULT_MS;
+      if (!principalId) {
+        sendJson(req, res, 400, { ok: false, error: "principalId is required" });
+        return;
+      }
+      if (!kernel.getPrincipal(tenant, principalId)) {
+        sendJson(req, res, 404, { ok: false, error: `unknown principal "${principalId}" in tenant "${tenant}"` });
+        return;
+      }
+      const { token, expiresAt } = mintSession(store.db, tenant, principalId, ttlMs);
+      sendJson(req, res, 200, { ok: true, token, tenant, principalId, expiresAt });
+      return;
+    }
+
+    if (req.method === "POST" && pathname === "/api/session/revoke") {
+      const token = bearer(req);
+      if (token && token.startsWith("hst_")) {
+        revokeSession(store.db, token);
+        sendJson(req, res, 200, { ok: true, revoked: "self" });
+        return;
+      }
+      if (adminAuthorized(req)) {
+        const body = await readBody(req);
+        const all = revokeAllSessionsForPrincipal(
+          store.db,
+          String(body.tenant ?? DEFAULT_TENANT),
+          String(body.principalId ?? ""),
+        );
+        sendJson(req, res, 200, { ok: true, revoked: all });
+        return;
+      }
+      sendJson(req, res, 403, { ok: false, error: "session bearer or admin token required" });
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/session/me") {
+      const ctx = resolveContext(req, url);
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "no valid hst_ session" });
+        return;
+      }
+      sendJson(req, res, 200, { ok: true, tenant: ctx.tenant, principalId: ctx.actor, via: ctx.via });
+      return;
+    }
+
     if (req.method === "GET" && pathname === "/api/integrations/status") {
-      sendJson(res, 200, integrationStatus());
+      sendJson(req, res, 200, integrationStatus());
       return;
     }
 
     if (req.method === "GET" && pathname === "/api/state") {
-      const tenant = url.searchParams.get("tenant") ?? DEFAULT_TENANT;
-      const snap = kernel.snapshotWorkspace(tenant);
-      sendJson(res, 200, {
+      const ctx = resolveContext(req, url);
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "session required (POST /api/session/mint with admin token, then Authorization: Bearer hst_…)" });
+        return;
+      }
+      const snap = kernel.snapshotWorkspace(ctx.tenant);
+      sendJson(req, res, 200, {
         ...snap,
-        activeTokens: Object.keys(getJar(tenant)),
+        actor: ctx.actor,
+        via: ctx.via,
       });
       return;
     }
 
     if (req.method === "GET" && pathname === "/api/search") {
-      const tenant = url.searchParams.get("tenant") ?? DEFAULT_TENANT;
+      const ctx = resolveContext(req, url);
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "session required" });
+        return;
+      }
       const q = url.searchParams.get("q") ?? "";
-      sendJson(res, 200, {
-        results: kernel.searchEvents(tenant, q),
+      sendJson(req, res, 200, {
+        results: kernel.searchEvents(ctx.tenant, q),
       });
       return;
     }
 
     if (req.method === "POST" && pathname === "/api/cli") {
       const body = await readBody(req);
-      const tenant = String(body.tenant ?? DEFAULT_TENANT);
-      const actor = String(body.actor ?? "ana");
+      const ctx = resolveContext(
+        req,
+        url,
+        typeof body.tenant === "string" ? body.tenant : undefined,
+        typeof body.actor === "string" ? body.actor : undefined,
+      );
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "session required" });
+        return;
+      }
       const line = String(body.line ?? "");
+      const jar = jarFor(ctx.jarKey);
       const out = executeHiveCli(
         kernel,
-        { tenantId: tenant, actor, tokenJar: getJar(tenant) },
+        { tenantId: ctx.tenant, actor: ctx.actor, tokenJar: jar },
         line,
       );
-      tokenJarsByTenant[tenant] = out.tokenJar;
-      sendJson(res, 200, {
+      tokenJars.set(ctx.jarKey, out.tokenJar);
+      sendJson(req, res, 200, {
         ...out,
-        state: kernel.snapshotWorkspace(tenant),
+        state: kernel.snapshotWorkspace(ctx.tenant),
       });
       return;
     }
 
     if (req.method === "POST" && pathname === "/api/ingest") {
       const body = await readBody(req);
-      const tenant = String(body.tenant ?? DEFAULT_TENANT);
+      const ctx = resolveContext(
+        req,
+        url,
+        typeof body.tenant === "string" ? body.tenant : undefined,
+        typeof body.actor === "string" ? body.actor : undefined,
+      );
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "session required" });
+        return;
+      }
+      const tenant = ctx.tenant;
       const source = (body.source as "slack" | "github" | "linear" | "ui") ?? "slack";
       const principalId = String(body.principalId ?? "guest-4471");
       const channel = String(body.channel ?? "dev");
@@ -360,7 +647,7 @@ const server = http.createServer(async (req, res) => {
           fromInbound: inbound,
         });
       }
-      sendJson(res, 200, {
+      sendJson(req, res, 200, {
         ok: true,
         inbound,
         createdTask,
@@ -371,21 +658,29 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/attestation") {
       const body = await readBody(req);
-      const tenant = String(body.tenant ?? DEFAULT_TENANT);
-      const actor = String(body.actor ?? "ana");
+      const ctx = resolveContext(
+        req,
+        url,
+        typeof body.tenant === "string" ? body.tenant : undefined,
+        typeof body.actor === "string" ? body.actor : undefined,
+      );
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "session required" });
+        return;
+      }
       const agentId = String(body.agentId ?? "fixer");
       const op = (body.op as "revoke" | "restore" | "expire") ?? "revoke";
-      kernel.setAgentAttestationStatus(tenant, actor, agentId, op);
-      sendJson(res, 200, {
+      kernel.setAgentAttestationStatus(ctx.tenant, ctx.actor, agentId, op);
+      sendJson(req, res, 200, {
         ok: true,
-        state: kernel.snapshotWorkspace(tenant),
+        state: kernel.snapshotWorkspace(ctx.tenant),
       });
       return;
     }
 
     if (req.method === "POST" && pathname === "/api/chaos-run") {
       const results = runLiveChaosSuite();
-      sendJson(res, 200, {
+      sendJson(req, res, 200, {
         ok: results.every((r) => r.ok),
         results,
       });
@@ -393,11 +688,25 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/scenario") {
+      if (!DEV_DRILLS) {
+        sendJson(req, res, 403, { ok: false, error: "dev drills are disabled (set HIVE_ENABLE_DEV_DRILLS=1 to enable)" });
+        return;
+      }
       const body = await readBody(req);
-      const tenant = String(body.tenant ?? DEFAULT_TENANT);
+      const ctx = resolveContext(
+        req,
+        url,
+        typeof body.tenant === "string" ? body.tenant : undefined,
+        typeof body.actor === "string" ? body.actor : undefined,
+      );
+      if (!ctx) {
+        sendJson(req, res, 401, { ok: false, error: "session required" });
+        return;
+      }
+      const tenant = ctx.tenant;
       const drill = String(body.drill ?? "");
       const taskId = String(body.taskId ?? "801");
-      const jar = getJar(tenant);
+      const jar = jarFor(ctx.jarKey);
       const logs: string[] = [];
 
       switch (drill) {
@@ -635,7 +944,7 @@ const server = http.createServer(async (req, res) => {
           throw new HiveError(400, "BAD_DRILL", `unknown drill "${drill}"`);
       }
 
-      sendJson(res, 200, {
+      sendJson(req, res, 200, {
         ok: true,
         logs,
         state: kernel.snapshotWorkspace(tenant),
@@ -644,28 +953,52 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/reset") {
+      if (!DEV_DRILLS) {
+        sendJson(req, res, 403, { ok: false, error: "reset is disabled (set HIVE_ENABLE_DEV_DRILLS=1 to enable)" });
+        return;
+      }
+      if (!adminAuthorized(req)) {
+        sendJson(req, res, 403, { ok: false, error: "admin token required to reset the database" });
+        return;
+      }
       resetAll();
-      const body = await readBody(req);
-      const tenant = String(body.tenant ?? DEFAULT_TENANT);
-      sendJson(res, 200, {
+      const body = await readBody(req).catch(() => ({}) as Record<string, unknown>);
+      const tenant =
+        resolveContext(req, url, typeof body.tenant === "string" ? body.tenant : undefined)?.tenant ??
+        DEFAULT_TENANT;
+      sendJson(req, res, 200, {
         ok: true,
         state: kernel.snapshotWorkspace(tenant),
       });
       return;
     }
 
-    sendJson(res, 404, { ok: false, error: `route not found: ${pathname}` });
+    sendJson(req, res, 404, { ok: false, error: `route not found: ${pathname}` });
   } catch (err) {
     const status = err instanceof HiveError ? err.status : 500;
     const message = err instanceof Error ? err.message : String(err);
-    sendJson(res, status, { ok: false, error: message });
+    sendJson(req, res, status, { ok: false, error: message });
   }
 });
+
+for (const tenant of ["acme", "globex"]) {
+  try {
+    const r = kernel.reconcileOutbox(tenant);
+    if (r.drained > 0 || r.closed > 0 || r.failed > 0) {
+      console.log(`[hive-reconcile] tenant=${tenant} drained=${r.drained} closed=${r.closed} failed=${r.failed}`);
+    }
+  } catch (err) {
+    console.error(`[hive-reconcile] tenant=${tenant} FAILED:`, err instanceof Error ? err.message : err);
+  }
+}
 
 server.listen(PORT, HOST, () => {
   const s = integrationStatus();
   console.log(
     `[hive-authority] listening on http://${HOST}:${PORT} (db=${DB_PATH}, incarnation=${kernel.getIncarnation()})`,
+  );
+  console.log(
+    `[hive-auth] admin=${ADMIN_TOKEN ? "set" : "unset (dev-open)"} sessionEnforcement=on devInsecureActor=${DEV_INSECURE_ACTOR ? "ON (unsafe!)" : "off"} devDrills=${DEV_DRILLS ? "on" : "off"} origins=${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(",") : "loopback"} hosts=${ALLOWED_HOSTS.length ? ALLOWED_HOSTS.join(",") : "any (dev)"}`,
   );
   console.log(
     `[hive-integrations] mode=${s.mode} github=${s.github.mode} [${s.github.detail}] slack=${s.slack.mode} [${s.slack.detail}] gateway=${s.gatewayAuth}`,
