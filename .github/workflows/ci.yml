@@ -48,6 +48,48 @@ jobs:
           path: playwright-report/
           retention-days: 7
 
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t hive:ci .
+      - name: Boot container (production boot requires master key)
+        run: |
+          docker run -d --name hive -p 8787:8787 \
+            -e HIVE_ADMIN_TOKEN="$(openssl rand -hex 24)" \
+            -e HIVE_MASTER_KEY="$(openssl rand -base64 32)" \
+            hive:ci
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8787/api/health > /dev/null 2>&1; then
+              echo "container healthy after ${i} poll(s)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "container failed to become healthy"; docker logs hive; exit 1
+      - name: Single-origin assertions (SPA headers, asset, anonymous 401)
+        run: |
+          curl -fsS -D /tmp/headers -o /tmp/index.html http://127.0.0.1:8787/
+          grep -i "content-security-policy" /tmp/headers | grep -i "default-src 'self'"
+          grep -i "x-content-type-options: nosniff" /tmp/headers
+          grep -o 'assets/index-[^"]*\.js' /tmp/index.html
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8787/api/state?tenant=acme')" = "401"
+      - name: Teardown (always)
+        if: always()
+        run: docker rm -f hive || true
+
+  drill-backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run drill:backup
+      - run: npm run drill:stuck-verifier
+
   postgres-rls:
     runs-on: ubuntu-latest
     services:
