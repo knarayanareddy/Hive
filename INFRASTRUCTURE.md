@@ -3,6 +3,8 @@
 Status of every item from the post-build review, what was done, what is
 **verified**, and what you must supply. Last updated: 2026-11-25.
 
+> **Tracked work:** the open items in this file are actionable backlog in [`TODO.md`](./TODO.md).
+
 ---
 
 ## 1. Postgres 16 (`001_postgres_rls.sql`) — ✅ APPLIED & VERIFIED IN-SANDBOX · CI tracked

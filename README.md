@@ -4,7 +4,7 @@
 
 Hive is a fenced, verified agent coordination plane combining **Vercel Board**'s coordination primitives (tasks, leases, dependencies, watchers, path grants, structured schemas, two-way Slack/GitHub projections) with **Buzz**'s cryptographic event architecture (keypair identities, Owner Attestations, branch-as-room NIP-34 patches, unified full-text search, and a SHA-256 hash-chained signed event log) — hardened around a transactional **Authority Kernel**.
 
-See [`ARCHITECTURE_REVIEW.md`](./ARCHITECTURE_REVIEW.md) for the full end-to-end architectural and security review of the design specification.
+Open infrastructure items live in [`TODO.md`](./TODO.md); infrastructure runbook in [`INFRASTRUCTURE.md`](./INFRASTRUCTURE.md). See [`ARCHITECTURE_REVIEW.md`](./ARCHITECTURE_REVIEW.md) for the full end-to-end architectural and security review of the design specification.
 
 ---
 
