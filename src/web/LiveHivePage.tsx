@@ -275,6 +275,30 @@ export default function LiveHivePage() {
     return true;
   }, []);
 
+  const fetchState = useCallback(async (t = tenant) => {
+    const res = await apiFetch(`/api/state?tenant=${encodeURIComponent(t)}`);
+    if (note401(res)) return;
+    const data = (await res.json()) as WorkspaceSnapshot;
+    setSnap(data);
+    const maxSeq = data.events.reduce((m, e) => Math.max(m, e.seq), lastSeqRef.current);
+    lastSeqRef.current = maxSeq;
+  }, [tenant, note401]);
+
+  useEffect(() => {
+    void fetchState(tenant);
+  }, [tenant, fetchState]);
+
+  const loadIntegrations = useCallback(() => {
+    apiFetch("/api/integrations/status")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => setIntegrations((data as IntegrationsStatus | null) ?? null))
+      .catch(() => setIntegrations(null));
+  }, []);
+
+  useEffect(() => {
+    loadIntegrations();
+  }, [loadIntegrations]);
+
   const signIn = useCallback(async () => {
     setSignInError(null);
     const res = await apiFetch("/api/session/mint", {
@@ -296,7 +320,11 @@ export default function LiveHivePage() {
     setAuthBanner(null);
     setSignInOpen(false);
     setSignInAdminToken("");
-  }, [tenant, signInPrincipal, signInAdminToken]);
+    // The mount-time fetchState/integrations calls already ran without a session;
+    // pull both again now that we hold one, or the board stays on the sign-in card.
+    void fetchState(json.tenant ?? tenant);
+    loadIntegrations();
+  }, [tenant, signInPrincipal, signInAdminToken, fetchState, loadIntegrations]);
 
   const signOut = useCallback(async () => {
     try {
@@ -342,31 +370,11 @@ export default function LiveHivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tenant]);
 
-  const fetchState = useCallback(async (t = tenant) => {
-    const res = await apiFetch(`/api/state?tenant=${encodeURIComponent(t)}`);
-    if (note401(res)) return;
-    const data = (await res.json()) as WorkspaceSnapshot;
-    setSnap(data);
-    const maxSeq = data.events.reduce((m, e) => Math.max(m, e.seq), lastSeqRef.current);
-    lastSeqRef.current = maxSeq;
-  }, [tenant, note401]);
-
-  useEffect(() => {
-    void fetchState(tenant);
-  }, [tenant, fetchState]);
-
-  useEffect(() => {
-    apiFetch("/api/integrations/status")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => setIntegrations((data as IntegrationsStatus | null) ?? null))
-      .catch(() => setIntegrations(null));
-  }, []);
-
   // Live event stream (SSE via fetch — EventSource cannot send the hst_ bearer).
   // Debounced state refresh on every committed event; presence frames drive the badge.
   useEffect(() => {
     const hst = sessionStorage.getItem(HST_KEY);
-    if (!hst) {
+    if (!session || !hst) {
       setLive({ connected: false, watchers: 0 });
       return;
     }
@@ -433,7 +441,7 @@ export default function LiveHivePage() {
       ctrl.abort();
       if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
     };
-  }, [tenant, scheduleRefresh]);
+  }, [tenant, scheduleRefresh, session]);
 
   useEffect(() => {
     termRef.current?.scrollTo({ top: 1e6, behavior: "smooth" });
