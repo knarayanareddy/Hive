@@ -119,7 +119,20 @@ export class GitHubGateway {
         };
       }
       case "merge": {
-        const prNumber = Number(args.prNumber ?? 0);
+        let prNumber = Number(args.prNumber ?? 0);
+        if (!prNumber && args.branch) {
+          const branch = String(args.branch);
+          const owner = this.cfg.repo.split("/")[0];
+          const list = this.api(
+            "GET",
+            `/repos/${this.cfg.repo}/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=all&per_page=5`,
+          );
+          if (list.status === 200) {
+            const prs = (list.json ?? []) as Array<Record<string, unknown>>;
+            const hit = prs[0];
+            if (hit) prNumber = Number(hit.number ?? 0);
+          }
+        }
         if (!prNumber) return null;
         const res = this.api("GET", `/repos/${this.cfg.repo}/pulls/${prNumber}`);
         if (res.status !== 200) {
@@ -217,10 +230,24 @@ export class GitHubGateway {
         };
       }
       case "merge": {
-        const prNumber = Number(args.prNumber ?? 0);
-        if (!prNumber) throw new Error("github merge requires args.prNumber");
+        let prNumber = Number(args.prNumber ?? 0);
+        if (!prNumber && args.branch) {
+          const branch = String(args.branch);
+          const owner = this.cfg.repo.split("/")[0];
+          const list = this.api(
+            "GET",
+            `/repos/${this.cfg.repo}/pulls?head=${encodeURIComponent(`${owner}:${branch}`)}&state=all&per_page=5`,
+          );
+          if (list.status === 200) {
+            const prs = (list.json ?? []) as Array<Record<string, unknown>>;
+            const hit = prs.find((p) => p.state === "open") ?? prs[0];
+            if (hit) prNumber = Number(hit.number ?? 0);
+          }
+        }
+        if (!prNumber) throw new Error("github merge requires args.prNumber or a resolvable open PR for args.branch");
         const res = this.api("PUT", `/repos/${this.cfg.repo}/pulls/${prNumber}/merge`, {
           merge_method: String(args.mergeMethod ?? "squash"),
+          ...(args.headSha ? { sha: String(args.headSha) } : {}),
         });
         if (res.status !== 200) {
           throw new Error(`github merge refused (${res.status}): ${res.text.slice(0, 300)}`);

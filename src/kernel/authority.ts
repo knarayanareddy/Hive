@@ -21,6 +21,7 @@ import {
   enforceOutboundDlp,
   explainGrant,
   gatePolicyForTask,
+  matchScopePattern,
   resolveGatePolicyForPath,
   verifyPrincipalAuthority,
 } from "./policy";
@@ -51,6 +52,9 @@ import {
   type WakeRecord,
   type WorkingSetDelivery,
 } from "./types";
+
+/** Maximum verify→reject→reclaim attempts before a task is halted by the breaker (across lease epochs). */
+const MAX_ATTEMPTS = 5;
 
 export class HiveKernel {
   public readonly store: HiveStore;
@@ -84,7 +88,7 @@ export class HiveKernel {
         epoch: t.leaseEpoch,
         incarnation: meta.incarnation,
       },
-      meta.gatewayPriv,
+      this.store.gatewaySigningKey(),
     );
   }
 
@@ -626,7 +630,6 @@ export class HiveKernel {
     const createdAt = this.now();
 
     const principalRow = this.getPrincipalWithSecret(tId, params.actor);
-    const meta = this.store.getMeta();
     const trust: Trust =
       params.trust ??
       (principalRow
@@ -647,7 +650,7 @@ export class HiveKernel {
       createdAt,
     });
 
-    const signerKey = principalRow ? principalRow.privkey : meta.gatewayPriv;
+    const signerKey = principalRow ? principalRow.privkey : this.store.gatewaySigningKey();
     const sig = signEd25519(signerKey, id);
     const attest = params.attest ?? [];
 
@@ -820,7 +823,7 @@ export class HiveKernel {
         merkleRoot: root,
         incarnation: meta.incarnation,
       });
-      const sig = signEd25519(meta.gatewayPriv, preimage);
+      const sig = signEd25519(this.store.gatewaySigningKey(), preimage);
       this.store.db
         .prepare(
           `INSERT OR REPLACE INTO checkpoint (id, tenant_id, upto_seq, head_event_id, merkle_root, incarnation, sig, created_at)
@@ -1059,6 +1062,15 @@ export class HiveKernel {
         attestChain = claims.chain;
       }
     } else {
+      // Agents without a token may only chat under attestation scope — and never on
+      // a task thread (that path implies lease ownership). Humans act via attestation-free
+      // root authz. HTTP callers are bound to an authenticated session before this point.
+      const caller = this.getPrincipal(tId, params.actor);
+      if (caller?.kind === "agent" && params.taskId) {
+        throw new ForbiddenError(
+          `agent "${params.actor}" must present a lease-scoped hct_ capability token to post on task #${params.taskId}`,
+        );
+      }
       const auth = this.authorizePrincipal(tId, params.actor, "chat.post");
       attestChain = auth.attestChain;
     }
@@ -1228,7 +1240,29 @@ export class HiveKernel {
   ): { task: TaskRecord; epoch: number; token: string } {
     const tId = this.store.assertTenant(tenantId);
     return this.store.tx(() => {
-      const { attestChain } = this.authorizePrincipal(tId, params.actor, "task.claim");
+      const { principal, attestChain } = this.authorizePrincipal(tId, params.actor, "task.claim");
+      // Minted capability ops are the INTERSECTION of the static mint list with the
+      // agent's Owner Attestation scope — an agent attested only for patch:fix/*
+      // cannot be handed effect:post-github authority.
+      let mintableOps = [
+        "chat.post",
+        "task.renew",
+        "task.submit",
+        "patch:fix/*",
+        "effect:open-pr",
+        "effect:open-branch",
+        "effect:post-slack",
+        "effect:post-github",
+      ];
+      if (principal.kind === "agent") {
+        const scope = principal.attestation?.scope ?? [];
+        mintableOps = mintableOps.filter((op) => scope.some((pat) => matchScopePattern(pat, op)));
+        if (mintableOps.length === 0) {
+          throw new ForbiddenError(
+            `agent "${principal.id}" attestation scope cannot mint any task capability`,
+          );
+        }
+      }
 
       let target: TaskRecord | undefined;
       if (params.taskId) {
@@ -1286,21 +1320,12 @@ export class HiveKernel {
           incarnation: meta.incarnation,
           task: target.id,
           epoch,
-          ops: [
-            "chat.post",
-            "task.renew",
-            "task.submit",
-            "patch:fix/*",
-            "effect:open-pr",
-            "effect:open-branch",
-            "effect:post-slack",
-            "effect:post-github",
-          ],
+          ops: mintableOps,
           budgetCents: target.budgetCapCents,
           notAfter: leaseUntil,
           chain: attestChain,
         },
-        meta.gatewayPriv,
+        this.store.gatewaySigningKey(),
       );
 
       this.appendEvent(tId, {
@@ -1429,10 +1454,9 @@ export class HiveKernel {
         .run(leaseUntil, now, tId, task.id, task.revision, task.leaseEpoch);
       if (res.changes !== 1) throw new ConflictError("CAS conflict renewing lease");
 
-      const meta = this.store.getMeta();
       const newToken = mintCapabilityToken(
         { ...claims, notAfter: leaseUntil },
-        meta.gatewayPriv,
+        this.store.gatewaySigningKey(),
       );
 
       this.appendEvent(tId, {
@@ -1474,6 +1498,15 @@ export class HiveKernel {
       actor = g.claims.sub;
       attestChain = g.claims.chain;
     } else {
+      if (!params.actor) {
+        throw new ForbiddenError("pushPatch requires a lease-scoped hct_ token or an authenticated actor");
+      }
+      const caller = this.getPrincipal(tId, actor);
+      if (caller?.kind === "agent") {
+        throw new ForbiddenError(
+          `agent "${actor}" must present a lease-scoped hct_ capability token to push patches`,
+        );
+      }
       const auth = this.authorizePrincipal(tId, actor, "patch:fix/*");
       attestChain = auth.attestChain;
     }
@@ -1575,13 +1608,15 @@ export class HiveKernel {
         )
         .run(tId, task.id, claims.sub, task.leaseEpoch, params.costCents, params.callSignature, now);
 
+      // Count the streak across lease epochs: verify-fail -> re-claim bumps the
+      // epoch, which previously reset the 6x breaker forever.
       const recent = this.store.db
         .prepare(
           `SELECT call_sig FROM call_telemetry
-           WHERE tenant_id = ? AND task_id = ? AND lease_epoch = ?
+           WHERE tenant_id = ? AND task_id = ?
            ORDER BY id DESC LIMIT 6`,
         )
-        .all(tId, task.id, task.leaseEpoch) as { call_sig: string }[];
+        .all(tId, task.id) as { call_sig: string }[];
 
       const loopDetected =
         recent.length >= 6 && recent.every((r) => r.call_sig === params.callSignature);
@@ -1793,7 +1828,8 @@ export class HiveKernel {
     },
   ): { task: TaskRecord; evidence: EvidenceRecord } {
     const tId = this.store.assertTenant(tenantId);
-    return this.store.tx(() => {
+    let staged = false;
+    const result = this.store.tx(() => {
       const { attestChain } = this.authorizePrincipal(tId, params.actor, "task.verify");
       const task = this.getTask(tId, params.taskId);
 
@@ -1869,6 +1905,30 @@ export class HiveKernel {
 
       if (params.result === "fail") {
         const nextAttempt = task.attempt + 1;
+        // Hard cap on verify→reject→reclaim cycles (across lease epochs) so a
+        // deterministically failing task cannot loop forever.
+        if (nextAttempt >= MAX_ATTEMPTS) {
+          this.store.db
+            .prepare(
+              `UPDATE task
+               SET state = 'halted', attempt = ?, revision = revision + 1, updated_at = ?
+               WHERE tenant_id = ? AND id = ? AND revision = ?`,
+            )
+            .run(nextAttempt, now, tId, task.id, task.revision);
+          this.appendEvent(tId, {
+            kind: "task.halted",
+            actor: params.actor,
+            channel: task.channel,
+            taskId: task.id,
+            attest: attestChain,
+            payload: {
+              reason: `attempt_cap_${nextAttempt}`,
+              headSha: params.headSha,
+              evidenceId: evId,
+            },
+          });
+          return { task: this.getTask(tId, task.id), evidence };
+        }
         this.store.db
           .prepare(
             `UPDATE task
@@ -1951,10 +2011,13 @@ export class HiveKernel {
         return { task: this.getTask(tId, task.id), evidence };
       }
 
-      // No human gate required -> execute idempotent merge & VerifiedClose!
+      // No human gate required -> stage idempotent merge; drained post-commit!
       this.completeMergeAndVerifiedClose(tId, task.id, "hive-kernel");
+      staged = true;
       return { task: this.getTask(tId, task.id), evidence };
     });
+    if (staged) this.finalizeVerifiedClose(tId, params.taskId, "hive-kernel");
+    return { task: this.getTask(tId, params.taskId), evidence: result.evidence };
   }
 
   /**
@@ -1973,7 +2036,8 @@ export class HiveKernel {
     },
   ): { task: TaskRecord; approval: ApprovalRecord; gateSatisfied: boolean } {
     const tId = this.store.assertTenant(tenantId);
-    return this.store.tx(() => {
+    let staged: string | null = null;
+    const result = this.store.tx(() => {
       const humanWithKey = this.getPrincipalWithSecret(tId, params.actor);
       if (!humanWithKey) {
         throw new ForbiddenError(`unknown principal "${params.actor}"`);
@@ -1985,6 +2049,17 @@ export class HiveKernel {
       }
 
       const task = this.getTask(tId, params.taskId);
+
+      // The approver must hold channel access for the task's channel (grant_rule),
+      // and protected security/ two_of_three gates additionally require an
+      // elevated role — a `member` can never satisfy a security gate.
+      this.requireChannelAccess(tId, params.actor, task.channel, "post");
+      if (gatePolicyForTask(task) === "two_of_three" &&
+          !["owner", "lead", "security"].includes(humanWithKey.role)) {
+        throw new ForbiddenError(
+          `gate on ${task.protectedPath ?? task.channel} requires role owner|lead|security (actor "${params.actor}" has role ${humanWithKey.role})`,
+        );
+      }
       if (!task.headSha) {
         throw new ConflictError(`task #${task.id} has no head SHA to approve`);
       }
@@ -2049,6 +2124,16 @@ export class HiveKernel {
       };
 
       if (params.decision === "reject") {
+        // A reject invalidates all outstanding approvals for THIS head SHA so a
+        // later /ship cannot resurrect a gate the human already refused.
+        this.store.db
+          .prepare(
+            `UPDATE approval
+             SET invalidated_at = ?, invalidated_reason = 'gate_rejected'
+             WHERE tenant_id = ? AND task_id = ? AND head_sha = ? AND decision = 'approve' AND invalidated_at IS NULL`,
+          )
+          .run(now, tId, task.id, targetSha);
+
         this.store.db
           .prepare(
             `UPDATE task SET state = 'reopened', revision = revision + 1, updated_at = ?
@@ -2095,10 +2180,17 @@ export class HiveKernel {
       const satisfied = this.isMergeAllowed(tId, task.id).allowed;
       if (satisfied && params.autoShip !== false) {
         this.completeMergeAndVerifiedClose(tId, task.id, params.actor);
+        staged = task.id;
       }
 
       return { task: this.getTask(tId, task.id), approval, gateSatisfied: satisfied };
     });
+    if (staged) this.finalizeVerifiedClose(tId, staged, params.actor);
+    return {
+      task: this.getTask(tId, params.taskId),
+      approval: result.approval,
+      gateSatisfied: result.gateSatisfied,
+    };
   }
 
   public isMergeAllowed(
@@ -2168,31 +2260,52 @@ export class HiveKernel {
 
   public shipTask(tenantId: string, actorId: string, taskId: string): TaskRecord {
     const tId = this.store.assertTenant(tenantId);
-    return this.store.tx(() => {
+    this.store.tx(() => {
       this.requirePrincipal(tId, actorId);
       const check = this.isMergeAllowed(tId, taskId);
       if (!check.allowed) {
         throw new ForbiddenError(`merge refused by kernel gate: ${check.reason}`);
       }
       this.completeMergeAndVerifiedClose(tId, taskId, actorId);
-      return this.getTask(tId, taskId);
     });
+    this.finalizeVerifiedClose(tId, taskId, actorId);
+    return this.getTask(tId, taskId);
   }
 
   private completeMergeAndVerifiedClose(
     tenantId: string,
     taskId: string,
-    actorId: string,
+    _actorId: string,
   ): void {
-    const task = this.getTask(tenantId, taskId);
-    const check = this.isMergeAllowed(tenantId, taskId);
+    const tId = this.store.assertTenant(tenantId);
+    const task = this.getTask(tId, taskId);
+    const check = this.isMergeAllowed(tId, taskId);
     if (!check.allowed) {
       throw new ForbiddenError(`cannot merge/close task #${taskId}: ${check.reason}`);
     }
 
-    // 1. Execute idempotent merge via outbox
-    const mergeReceipt = this.executeOutboxInternal(
-      tenantId,
+    // 1. Stage the merge outbox row ONLY (network I/O happens post-commit in
+    //    finalizeVerifiedClose). Resolve prNumber from the confirmed open-pr receipt
+    //    so live GitHub merge actually works.
+    let prNumber: number | null = null;
+    try {
+      const prRow = this.store.db
+        .prepare(
+          `SELECT receipt_json FROM outbox
+           WHERE tenant_id = ? AND task_id = ? AND effect = 'open-pr' AND status = 'confirmed'
+           ORDER BY updated_at DESC LIMIT 1`,
+        )
+        .get(tId, task.id) as { receipt_json: string | null } | undefined;
+      if (prRow?.receipt_json) {
+        const receipt = JSON.parse(prRow.receipt_json) as Record<string, unknown>;
+        const n = Number(receipt.prNumber ?? 0);
+        if (n > 0) prNumber = n;
+      }
+    } catch {
+      prNumber = null;
+    }
+    this.stageOutboxEffect(
+      tId,
       `task:${task.id}/sha:${task.headSha}/merge`,
       task.id,
       task.leaseEpoch,
@@ -2200,33 +2313,61 @@ export class HiveKernel {
       {
         taskId: task.id,
         headSha: task.headSha,
-        repo: "acme/www",
+        repo: process.env.HIVE_GITHUB_REPO?.trim() || "acme/www",
         branch: task.branchRoom?.replace(/^branch\//, "") ?? `fix/task-${task.id}`,
+        ...(prNumber ? { prNumber } : {}),
       },
-      actorId,
     );
+  }
+
+  /**
+   * Drain the staged merge effect (network I/O, no transaction held), then CAS the
+   * task merged→closed with a VerifiedClose receipt. On drain failure the task is
+   * left pre-close with a `task.effect_failed` event; approvals and evidence stay
+   * committed, and `/ship` re-attempts with the same idempotency key.
+   */
+  public finalizeVerifiedClose(tenantId: string, taskId: string, actorId: string): TaskRecord {
+    const tId = this.store.assertTenant(tenantId);
+    const task = this.getTask(tId, taskId);
+    if (task.state === "closed") return task; // finalize is idempotent
+    const key = `task:${task.id}/sha:${task.headSha}/merge`;
+    let mergeReceipt: Record<string, unknown>;
+    try {
+      mergeReceipt = this.drainOutboxEffect(tId, key, actorId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.appendEvent(tId, {
+        kind: "task.effect_failed",
+        actor: actorId,
+        channel: task.channel,
+        taskId: task.id,
+        payload: { effect: "merge", error: msg, idempotencyKey: key },
+      });
+      return this.getTask(tId, taskId);
+    }
 
     const now = this.now();
-    this.store.db
-      .prepare(
-        `UPDATE task SET state = 'merged', revision = revision + 1, updated_at = ?
-         WHERE tenant_id = ? AND id = ?`,
-      )
-      .run(now, tenantId, task.id);
+    return this.store.tx(() => {
+      this.store.db
+        .prepare(
+          `UPDATE task SET state = 'merged', revision = revision + 1, updated_at = ?
+           WHERE tenant_id = ? AND id = ?`,
+        )
+        .run(now, tId, task.id);
 
-    this.appendEvent(tenantId, {
-      kind: "task.merged",
-      actor: actorId,
-      channel: task.channel,
-      taskId: task.id,
-      payload: { headSha: task.headSha, mergeReceipt },
-    });
+      this.appendEvent(tId, {
+        kind: "task.merged",
+        actor: actorId,
+        channel: task.channel,
+        taskId: task.id,
+        payload: { headSha: task.headSha, mergeReceipt },
+      });
 
-    // 2. Final CAS write: VerifiedClose receipt + audit checkpoint
-    const evHashes = this.listEvidence(tenantId, task.id)
+        // Final CAS write: VerifiedClose receipt + audit checkpoint
+      const evHashes = this.listEvidence(tId, task.id)
       .filter((e) => e.passed && e.headSha === task.headSha)
       .map((e) => e.receiptHash);
-    const appSigs = this.listApprovals(tenantId, task.id)
+      const appSigs = this.listApprovals(tId, task.id)
       .filter((a) => a.decision === "approve" && !a.invalidatedAt && a.headSha === task.headSha)
       .map((a) => a.sig);
 
@@ -2249,7 +2390,7 @@ export class HiveKernel {
          SET state = 'closed', verified_close = ?, lease_until = NULL, revision = revision + 1, updated_at = ?
          WHERE tenant_id = ? AND id = ? AND revision = ? AND state = 'merged'`,
       )
-      .run(verifiedClose, now, tenantId, task.id, cur.revision);
+      .run(verifiedClose, now, tId, task.id, cur.revision);
     if (closeRes.changes !== 1) {
       throw new ConflictError("CAS conflict finalizing VerifiedClose");
     }
@@ -2267,10 +2408,12 @@ export class HiveKernel {
       },
     });
 
-    this.createCheckpoint(tenantId);
+      this.createCheckpoint(tId);
 
-    // 3. Unblock any dependent tasks whose dependencies are now ALL closed with VerifiedClose!
-    this.unblockDependents(tenantId, task.id);
+      // 3. Unblock any dependent tasks whose dependencies are now ALL closed with VerifiedClose!
+      this.unblockDependents(tId, task.id);
+      return this.getTask(tId, taskId);
+    });
   }
 
   private unblockDependents(tenantId: string, closedTaskId: string) {
@@ -2346,7 +2489,15 @@ export class HiveKernel {
         actor = claims.sub;
       }
     } else if (params.actor) {
+      const caller = this.getPrincipal(tId, params.actor);
+      if (caller?.kind === "agent") {
+        throw new ForbiddenError(
+          `agent "${params.actor}" must present a lease-scoped hct_ capability token to fire effects`,
+        );
+      }
       this.authorizePrincipal(tId, params.actor, `effect:${params.effect}`);
+    } else {
+      throw new ForbiddenError("runEffect requires a lease-scoped hct_ token or an authenticated actor");
     }
 
     if (params.effect === "merge") {
@@ -2357,26 +2508,18 @@ export class HiveKernel {
       }
     }
 
-    return this.executeOutboxInternal(
-      tId,
-      params.key,
-      taskId ?? null,
-      leaseEpoch,
-      params.effect,
-      params.args,
-      actor,
-    );
+    this.stageOutboxEffect(tId, params.key, taskId ?? null, leaseEpoch, params.effect, params.args);
+    return this.drainOutboxEffect(tId, params.key, actor);
   }
 
-  private executeOutboxInternal(
+  private stageOutboxEffect(
     tenantId: string,
     key: string,
     taskId: string | null,
     leaseEpoch: number | null,
     effect: EffectKind,
     args: Record<string, unknown>,
-    actor: string,
-  ): Record<string, unknown> {
+  ): void {
     const now = this.now();
     this.store.db
       .prepare(
@@ -2385,31 +2528,72 @@ export class HiveKernel {
          VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, 0, NULL, ?, ?)`,
       )
       .run(key, tenantId, taskId, leaseEpoch, effect, canonicalJson(args), now, now);
+  }
 
-    const existingRow = this.store.db
+  private markOutboxFailed(tenantId: string, key: string, msg: string): void {
+    const now = this.now();
+    this.store.db
+      .prepare(
+        `UPDATE outbox SET status = 'failed', last_error = ?, updated_at = ?
+         WHERE tenant_id = ? AND idempotency_key = ?`,
+      )
+      .run(msg, now, tenantId, key);
+  }
+
+  /**
+   * Drain one staged outbox effect: outbound DLP check first, then read-after-write
+   * reconciliation (findExisting) and perform. Runs OUTSIDE any transaction.
+   * Marks the row 'failed' and throws on error.
+   */
+  private drainOutboxEffect(
+    tenantId: string,
+    key: string,
+    actor: string,
+  ): Record<string, unknown> {
+    const tId = this.store.assertTenant(tenantId);
+    const row = this.store.db
       .prepare("SELECT * FROM outbox WHERE tenant_id = ? AND idempotency_key = ?")
-      .get(tenantId, key) as {
-      status: string;
-      receipt_json: string | null;
-      attempts: number;
-    };
+      .get(tId, key) as
+      | {
+          effect: EffectKind;
+          args_json: string;
+          status: string;
+          receipt_json: string | null;
+          task_id: string | null;
+        }
+      | undefined;
+    if (!row) throw new ValidationError(`outbox key "${key}" was not staged`);
+    const effect = row.effect;
+    const taskId = row.task_id;
+    const args = JSON.parse(row.args_json) as Record<string, unknown>;
 
-    if (existingRow.status === "confirmed" && existingRow.receipt_json) {
-      return JSON.parse(existingRow.receipt_json) as Record<string, unknown>;
+    // Outbound DLP runs post-commit, pre-send: a blocked payload marks the row
+    // 'failed' with the reason and never reaches the provider.
+    try {
+      enforceOutboundDlp(canonicalJson(args));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.markOutboxFailed(tId, key, msg);
+      throw err;
     }
 
+    if (row.status === "confirmed" && row.receipt_json) {
+      return JSON.parse(row.receipt_json) as Record<string, unknown>;
+    }
+
+    const now = this.now();
     this.store.db
       .prepare(
         `UPDATE outbox SET attempts = attempts + 1, status = 'sent', updated_at = ?
          WHERE tenant_id = ? AND idempotency_key = ?`,
       )
-      .run(now, tenantId, key);
+      .run(now, tId, key);
 
     try {
       // Read-after-write check first so retries after network drops never duplicate!
-      const reconciled = this.connectors.findExisting(tenantId, effect, args, key);
+      const reconciled = this.connectors.findExisting(tId, effect, args, key);
       const receipt =
-        reconciled ?? this.connectors.perform(tenantId, effect, args, key);
+        reconciled ?? this.connectors.perform(tId, effect, args, key);
 
       this.store.db
         .prepare(
@@ -2417,12 +2601,12 @@ export class HiveKernel {
            SET status = 'confirmed', receipt_json = ?, last_error = NULL, updated_at = ?
            WHERE tenant_id = ? AND idempotency_key = ?`,
         )
-        .run(canonicalJson(receipt), now, tenantId, key);
+        .run(canonicalJson(receipt), now, tId, key);
 
-      this.appendEvent(tenantId, {
+      this.appendEvent(tId, {
         kind: `effect.${effect}`,
         actor,
-        channel: taskId ? this.findTask(tenantId, taskId)?.channel ?? null : null,
+        channel: taskId ? this.findTask(tId, taskId)?.channel ?? null : null,
         taskId,
         payload: { idempotencyKey: key, receipt },
       });
@@ -2432,18 +2616,13 @@ export class HiveKernel {
           .prepare(
             "UPDATE task SET head_sha = COALESCE(head_sha, ?) WHERE tenant_id = ? AND id = ?",
           )
-          .run(String(receipt.headSha), tenantId, taskId);
+          .run(String(receipt.headSha), tId, taskId);
       }
 
       return receipt;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.store.db
-        .prepare(
-          `UPDATE outbox SET status = 'failed', last_error = ?, updated_at = ?
-           WHERE tenant_id = ? AND idempotency_key = ?`,
-        )
-        .run(msg, now, tenantId, key);
+      this.markOutboxFailed(tId, key, msg);
       throw err;
     }
   }

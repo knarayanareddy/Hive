@@ -188,7 +188,7 @@ test("integrations.spec — kernel outbox drives LIVE GitHub + Slack mocks with 
       key: "task:801/notif/slack",
       effect: "post-slack",
       args: { channel: "#triage", text: "checkout fix verified on Safari 17" },
-      actor: "fixer",
+      token: claim.token,
     });
     assert.equal(slackReceipt.via, "slack-webhook");
     let slack = (await mockState(ports.slack)) as { webhookPosts: string[] };
@@ -201,7 +201,7 @@ test("integrations.spec — kernel outbox drives LIVE GitHub + Slack mocks with 
       key: "task:801/notif/slack",
       effect: "post-slack",
       args: { channel: "#triage", text: "checkout fix verified on Safari 17" },
-      actor: "fixer",
+      token: claim.token,
     });
     slack = (await mockState(ports.slack)) as typeof slack;
     assert.equal(slack.webhookPosts.length, 1);
@@ -222,9 +222,9 @@ test("integrations.spec — kernel outbox drives LIVE GitHub + Slack mocks with 
           key: "task:801/secret-leak",
           effect: "post-slack",
           args: { channel: "#triage", text: "deploy key sk_live_abcdefghijklmnop" },
-          actor: "fixer",
+          token: claim.token,
         }),
-      /sk_live|DLP|secret/i,
+      /DLP|secret/i,
     );
     slack = (await mockState(ports.slack)) as typeof slack;
     assert.equal(slack.webhookPosts.length, 1);

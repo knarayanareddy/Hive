@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import crypto from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -65,6 +66,18 @@ export class HiveStore {
     return tenantId.trim();
   }
 
+  /**
+   * Gateway signing key. When HIVE_GATEWAY_SIGNING_KEY (base64url Ed25519 PKCS8 DER)
+   * is set, it overrides the custodial gateway_priv stored in authority_meta so the
+   * private key can live outside the database (KMS/HSM-backed env). The DB copy is
+   * ignored for signing while the env var is set.
+   */
+  public gatewaySigningKey(): string {
+    const fromEnv = process.env.HIVE_GATEWAY_SIGNING_KEY?.trim();
+    if (fromEnv) return fromEnv;
+    return this.getMeta().gatewayPriv;
+  }
+
   public getMeta(): AuthorityMeta {
     const row = this.db
       .prepare(
@@ -117,12 +130,15 @@ export class HiveStore {
    * Export raw SQLite backup bytes (used for PITR restore drills & tests).
    */
   public exportBackupTempFile(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hive-pitr-"));
+    fs.chmodSync(dir, 0o700);
     const tmp = path.join(
-      "/tmp",
+      dir,
       `hive-pitr-snap-${Date.now()}-${Math.random().toString(36).slice(2)}.db`,
     );
     const escaped = tmp.replace(/'/g, "''");
     this.db.exec(`VACUUM INTO '${escaped}';`);
+    fs.chmodSync(tmp, 0o600);
     return tmp;
   }
 
@@ -138,6 +154,10 @@ export class HiveStore {
       fs.copyFileSync(backupFile, copyFile);
       this.db = new DatabaseSync(copyFile);
     } else {
+      // Remove stale WAL/SHM first: a -wal from before the crash would be replayed
+      // onto the restored snapshot, corrupting the restored DB (and FTS5 shadow tables).
+      fs.rmSync(this.filePath + "-wal", { force: true });
+      fs.rmSync(this.filePath + "-shm", { force: true });
       fs.copyFileSync(backupFile, this.filePath);
       this.db = new DatabaseSync(this.filePath);
     }

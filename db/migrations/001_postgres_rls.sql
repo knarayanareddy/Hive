@@ -211,3 +211,34 @@ BEGIN
     );
   END LOOP;
 END $$;
+
+-- Principal sessions (per-principal HTTP identity; replaces shared bearer for actions)
+CREATE TABLE IF NOT EXISTS principal_session (
+  token_hash    TEXT PRIMARY KEY,
+  tenant_id     TEXT NOT NULL,
+  principal_id  TEXT NOT NULL,
+  created_at    BIGINT NOT NULL,
+  expires_at    BIGINT NOT NULL,
+  last_used_at  BIGINT,
+  revoked       INTEGER NOT NULL DEFAULT 0
+);
+ALTER TABLE principal_session ENABLE ROW LEVEL SECURITY;
+ALTER TABLE principal_session FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON principal_session;
+CREATE POLICY tenant_isolation ON principal_session
+  USING (tenant_id = current_setting('app.tenant_id', true) AND current_setting('app.tenant_id', true) <> '')
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true) AND current_setting('app.tenant_id', true) <> '');
+
+-- Inbound webhook replay deduplication
+CREATE TABLE IF NOT EXISTS webhook_delivery (
+  delivery_id   TEXT PRIMARY KEY,
+  tenant_id     TEXT NOT NULL,
+  source        TEXT NOT NULL,
+  received_at   BIGINT NOT NULL
+);
+ALTER TABLE webhook_delivery ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_delivery FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON webhook_delivery;
+CREATE POLICY tenant_isolation ON webhook_delivery
+  USING (tenant_id = current_setting('app.tenant_id', true) AND current_setting('app.tenant_id', true) <> '')
+  WITH CHECK (tenant_id = current_setting('app.tenant_id', true) AND current_setting('app.tenant_id', true) <> '');
